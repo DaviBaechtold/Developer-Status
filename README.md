@@ -1,69 +1,69 @@
 # Developer Status (NOC Bot)
 
-Bot de Discord pra monitoramento de infraestrutura de time de dev: acompanha status de serviços de terceiros (GitHub, Vercel, OpenAI, AWS...), pinga URLs próprias com checagem de SSL, e recebe webhooks de CI/CD (GitHub Actions, Jenkins) roteados por canal.
+Discord bot for a dev team's infrastructure monitoring: tracks the status of third-party services (GitHub, Vercel, OpenAI, AWS...), pings your own URLs with SSL expiry checks, and receives CI/CD webhooks (GitHub Actions, Jenkins) routed per channel.
 
 ## Setup
 
 ```bash
 npm install
-cp .env.example .env   # preenche DISCORD_TOKEN e WEBHOOK_KEY
+cp .env.example .env   # fill in DISCORD_TOKEN and WEBHOOK_KEY
 node index.js
 ```
 
 ### `.env`
 
-| Variável | O que é |
+| Variable | What it is |
 |---|---|
-| `DISCORD_TOKEN` | Token do bot, gerado em [discord.com/developers/applications](https://discord.com/developers/applications) → seu app → Bot |
-| `WEBHOOK_KEY` | Chave que os pipelines externos mandam no header `X-API-KEY` pra postar alertas |
+| `DISCORD_TOKEN` | Bot token, generated at [discord.com/developers/applications](https://discord.com/developers/applications) → your app → Bot |
+| `WEBHOOK_KEY` | Key external pipelines send in the `X-API-KEY` header to post alerts |
 
-Precisa da intent **Message Content** ligada na aba Bot do Developer Portal (o bot lê comandos como texto puro).
+You need the **Message Content** intent enabled on the Bot tab of the Developer Portal (the bot reads commands as plain text).
 
-### Convidar pro servidor
+### Invite it to a server
 
-Developer Portal → OAuth2 → URL Generator → scope `bot` → permissões (`Administrador` resolve, ou o mínimo: Ver Canais, Enviar Mensagens, Inserir Links, Mencionar Todos, Adicionar Reações) → abre a URL gerada e escolhe o servidor.
+Developer Portal → OAuth2 → URL Generator → scope `bot` → permissions (`Administrator` just works, or the minimal set: View Channels, Send Messages, Embed Links, Mention Everyone, Add Reactions) → open the generated URL and pick the server.
 
-## Configuração inicial (dentro do Discord)
+## Initial setup (inside Discord)
 
 ```
-!config #canal-devops @TimeTécnico @GerentesProjeto
+!config #devops-channel @TechTeam @ProjectManagers
 ```
 
-Define o canal de alertas, o cargo mencionado quando algo cai e o cargo com permissão pra gerenciar a esteira local (`!monitorar`, `!incidente` etc). Sem cargo admin configurado, só Administradores do servidor mexem nisso.
+Sets the alert channel, the role mentioned when something goes down, and the role allowed to manage the local watchlist (`!monitor`, `!incident`, etc). With no admin role configured, only server Administrators can touch it.
 
-## Comandos
+## Commands
 
-Rodar `!help` no Discord abre o painel interativo com tudo isso, mas resumindo:
+Run `!help` in Discord for the interactive panel with all of this, but the short version:
 
-- `!status` — menu pra investigar incidente de um serviço específico
-- `!status all` — dashboard com todos os serviços por stack + projetos locais
-- `!relatorio` — uptime dos últimos 7 dias
-- `!config <#canal> <@cargoAlerta> <@cargoAdmin>` — admin only
-- `!monitorar <id> <url> <Nome>` — adiciona URL própria à esteira (ping a cada 5min + SSL)
-- `!ssl ignorar <id>` — desativa checagem de SSL pra um serviço
-- `!incidente <id> <mensagem>` / `!resolver <id>` — pausa/retoma monitoramento manual
-- `!remover <id>` — tira da esteira
-- `!canal <id_webhook> #canal` — roteia os webhooks de um projeto pra um canal específico (em vez de cair no broadcast geral)
+- `!status` — menu to investigate a specific service's incidents
+- `!status all` — dashboard with every service grouped by stack + local projects
+- `!report` — uptime over the last 7 days
+- `!config <#channel> <@alertRole> <@adminRole>` — admin only
+- `!monitor <id> <url> <Name>` — adds your own URL to the watchlist (ping every 5min + SSL)
+- `!ssl ignore <id>` — disables SSL check for a service
+- `!incident <id> <message>` / `!resolve <id>` — pause/resume manual monitoring
+- `!remove <id>` — drops it from the watchlist
+- `!channel <webhook_id> #channel` — routes a project's webhooks to a specific channel instead of the global broadcast
 
-## Webhooks de CI/CD
+## CI/CD Webhooks
 
-Endpoint genérico, protegido por API key:
+Generic endpoint, protected by API key:
 
 ```bash
-curl -X POST http://<ip-do-bot>:3000/webhook/<id_do_projeto> \
+curl -X POST http://<bot-ip>:3000/webhook/<project_id> \
   -H "Content-Type: application/json" \
   -H "X-API-KEY: <WEBHOOK_KEY>" \
-  -d '{"titulo": "Deploy Homolog", "mensagem": "Build passou.", "status": "info"}'
+  -d '{"title": "Homolog Deploy", "message": "Build passed.", "status": "info"}'
 ```
 
-`status` pode ser `erro` (alerta vermelho + menção do cargo) ou qualquer outra coisa (azul, informativo). Mapeia `<id_do_projeto>` pra um canal com `!canal`, senão cai no broadcast pra todos os servidores configurados.
+`status` can be `error` (red alert + role mention) or anything else (blue, informational). Map `<project_id>` to a channel with `!channel`, otherwise it falls back to the broadcast across every configured server.
 
-Pra **GitHub** (push/PR/commits) e **Jenkins**, geralmente nem precisa passar por aqui — dá pra usar o webhook nativo de canal do Discord direto nas configurações do repo/job. Esse endpoint é pra alertas que não têm integração nativa (CloudWatch, scripts internos etc).
+For **GitHub** (push/PR/commits) and **Jenkins**, you usually don't even need this endpoint — Discord's native channel webhook can be wired up directly in the repo/job settings. This endpoint is for alerts that have no native integration (CloudWatch, internal scripts, etc).
 
-## Serviços monitorados
+## Monitored services
 
-Editáveis em `endpoints.json` (formato Atlassian Statuspage `/api/v2/status.json`).
+Editable in `endpoints.json` (Atlassian Statuspage `/api/v2/status.json` format).
 
 ## Stack
 
-Node.js, discord.js v14, better-sqlite3 (estado persistido em `dados_bot.sqlite`, ignorado no git), Express (servidor de webhooks).
+Node.js, discord.js v14, better-sqlite3 (state persisted in `bot_data.sqlite`, gitignored), Express (webhook server).
