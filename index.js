@@ -439,11 +439,18 @@ client.on('messageCreate', async (message) => {
             const service = endpoints[i.values[0]];
             await i.deferUpdate();
             try {
-                const response = await axios.get(service.url.replace('status.json', 'incidents.json'), axiosConfig);
-                const incident = response.data.incidents.filter(inc => inc.status !== 'resolved')[0];
-                const embed = createEmbed(incident ? COLORS.danger : COLORS.success).setTitle(`🔍 Audit: ${service.name}`);
-                if (!incident) embed.setDescription('🟢 No anomalies reported.');
-                else embed.setDescription(`⚠️ **${incident.name}**\n${incident.incident_updates.slice(0, 2).map(up => `> **[${up.status.toUpperCase()}]** - ${up.body}`).join('\n\n')}`);
+                // summary.json covers both open incidents AND in-progress scheduled maintenance —
+                // incidents.json alone misses maintenance windows, which can also flip the indicator.
+                const response = await axios.get(service.url.replace('status.json', 'summary.json'), axiosConfig);
+                const incident = response.data.incidents.find(inc => inc.status !== 'resolved');
+                const maintenance = response.data.scheduled_maintenances.find(m => m.status === 'in_progress');
+                const event = incident || maintenance;
+                const embed = createEmbed(event ? COLORS.danger : COLORS.success).setTitle(`🔍 Audit: ${service.name}`);
+                if (!event) embed.setDescription('🟢 No anomalies reported.');
+                else {
+                    const icon = incident ? '⚠️' : '🔧';
+                    embed.setDescription(`${icon} **${event.name}**\n${event.incident_updates.slice(0, 2).map(up => `> **[${up.status.toUpperCase()}]** - ${up.body}`).join('\n\n')}`);
+                }
                 await msgMenu.edit({ embeds: [embed], components: [row] });
             } catch(e) { }
         });
