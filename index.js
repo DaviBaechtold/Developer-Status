@@ -29,21 +29,28 @@ db.exec(`
         admin_role TEXT
     );
     CREATE TABLE IF NOT EXISTS monitored_urls (
-        id TEXT PRIMARY KEY,
+        guild_id TEXT NOT NULL,
+        id TEXT NOT NULL,
         name TEXT,
         url TEXT,
         manual_incident TEXT,
-        ignore_ssl INTEGER DEFAULT 0
+        ignore_ssl INTEGER DEFAULT 0,
+        kind TEXT DEFAULT 'url',
+        PRIMARY KEY (guild_id, id)
     );
     CREATE TABLE IF NOT EXISTS uptime_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         service_id TEXT,
         status TEXT,
+        latency_ms INTEGER,
+        guild_id TEXT,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS webhook_channels (
         webhook_id TEXT PRIMARY KEY,
-        channel_id TEXT
+        channel_id TEXT,
+        webhook_key TEXT,
+        guild_id TEXT
     );
     CREATE TABLE IF NOT EXISTS service_state (
         id TEXT PRIMARY KEY,
@@ -59,16 +66,51 @@ db.exec(`
     );
 `);
 
-// Columns added after the initial release — ignore "duplicate column" on installs that already have them.
+// --- Migrations for installs created before multi-tenant scoping ---
 for (const stmt of [
-    `ALTER TABLE monitored_urls ADD COLUMN kind TEXT DEFAULT 'url'`,
     `ALTER TABLE webhook_channels ADD COLUMN webhook_key TEXT`,
-    `ALTER TABLE uptime_history ADD COLUMN latency_ms INTEGER`
-]) { try { db.exec(stmt); } catch (e) { /* column already exists */ } }
+    `ALTER TABLE webhook_channels ADD COLUMN guild_id TEXT`,
+    `ALTER TABLE uptime_history ADD COLUMN latency_ms INTEGER`,
+    `ALTER TABLE uptime_history ADD COLUMN guild_id TEXT`
+]) { try { db.exec(stmt); } catch (e) { /* already applied */ } }
 
-let endpoints = {};
+// monitored_urls needs a real rebuild, not just a column add: its primary key moves from a
+// bare `id` to (guild_id, id) so two different servers can both use the same short project id.
+{
+    const cols = db.prepare(`PRAGMA table_info(monitored_urls)`).all();
+    if (cols.length > 0 && !cols.some(c => c.name === 'guild_id')) {
+        db.exec(`ALTER TABLE monitored_urls RENAME TO monitored_urls_old`);
+        db.exec(`
+            CREATE TABLE monitored_urls (
+                guild_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                name TEXT,
+                url TEXT,
+                manual_incident TEXT,
+                ignore_ssl INTEGER DEFAULT 0,
+                kind TEXT DEFAULT 'url',
+                PRIMARY KEY (guild_id, id)
+            );
+        `);
+        // Pre-migration rows had no owning guild. Hand them to whatever guild has already run
+        // !config (best guess at who they belonged to) — otherwise there's nothing to attribute
+        // them to, so they're dropped rather than silently guessed at.
+        const fallbackGuild = db.prepare(`SELECT guild_id FROM guild_configs LIMIT 1`).get()?.guild_id;
+        if (fallbackGuild) {
+            db.prepare(`
+                INSERT INTO monitored_urls (guild_id, id, name, url, manual_incident, ignore_ssl, kind)
+                SELECT ?, id, name, url, manual_incident, ignore_ssl, COALESCE(kind, 'url') FROM monitored_urls_old
+            `).run(fallbackGuild);
+        }
+        db.exec(`DROP TABLE monitored_urls_old`);
+    }
+}
+
+let endpoints = {}; // shared third-party catalog — same for every guild, not tenant data
 let lastStatus = {};
-let lastStatusMonitoredUrls = {};
+let lastStatusMonitoredUrls = {}; // keyed "guildId:localId" — local watchlists are per-guild
+
+function localKey(guildId, id) { return `${guildId}:${id}`; }
 
 function loadEndpoints() {
     try {
@@ -92,7 +134,7 @@ function loadEndpoints() {
 // in-memory maps directly, so a crash/redeploy doesn't silently forget an ongoing outage.
 const upsertState = db.prepare(`INSERT OR REPLACE INTO service_state (id, status) VALUES (?, ?)`);
 function setExtStatus(key, status) { lastStatus[key] = status; upsertState.run(`ext:${key}`, status); }
-function setLocalStatus(id, status) { lastStatusMonitoredUrls[id] = status; upsertState.run(`local:${id}`, status); }
+function setLocalStatus(guildId, id, status) { lastStatusMonitoredUrls[localKey(guildId, id)] = status; upsertState.run(`local:${localKey(guildId, id)}`, status); }
 function loadPersistedState() {
     for (const row of db.prepare(`SELECT id, status FROM service_state`).all()) {
         if (row.id.startsWith('ext:')) lastStatus[row.id.slice(4)] = row.status;
@@ -129,11 +171,16 @@ function logAudit(guildId, userTag, action, details) {
     try { insertAudit.run(guildId || 'unknown', userTag, action, details || ''); } catch (e) { /* best effort */ }
 }
 
-function broadcastAlert(alertEmbed, hasProblem) {
+// hasProblem-only alerts (third-party catalog) broadcast to every configured guild by default.
+// Pass guildId to scope an alert to a single server — used for each guild's own local watchlist,
+// so one server's private project outage doesn't get posted into every other server's channel.
+function broadcastAlert(alertEmbed, hasProblem, guildId = null) {
     alertEmbed.setColor(hasProblem ? COLORS.danger : COLORS.success);
     alertEmbed.setTitle(hasProblem ? '🚨 Infrastructure Alert' : '✅ Systems Back to Normal');
 
-    const guilds = db.prepare(`SELECT guild_id, channel_id, alert_role FROM guild_configs`).all();
+    const guilds = guildId
+        ? db.prepare(`SELECT guild_id, channel_id, alert_role FROM guild_configs WHERE guild_id = ?`).all(guildId)
+        : db.prepare(`SELECT guild_id, channel_id, alert_role FROM guild_configs`).all();
     for (const config of guilds) {
         client.channels.fetch(config.channel_id).then(channel => {
             if (channel) {
@@ -160,11 +207,11 @@ function dispatchWebhookAlert(webhookId, title, msg, hasProblem) {
 // ==========================================
 // 3. GLOBAL MONITORING ENGINE
 // ==========================================
-async function globalMonitoring() {
-    let hasChanged = false;
+const insertHistory = db.prepare(`INSERT INTO uptime_history (service_id, status, latency_ms, guild_id) VALUES (?, ?, ?, ?)`);
+
+async function monitorThirdParty() {
+    let hasChanged = false, hasProblem = false;
     const alertEmbed = createEmbed().setFooter({ text: 'Automated NOC Center' });
-    let hasProblem = false;
-    const insertHistory = db.prepare(`INSERT INTO uptime_history (service_id, status, latency_ms) VALUES (?, ?, ?)`);
 
     for (const [key, service] of Object.entries(endpoints)) {
         try {
@@ -183,19 +230,24 @@ async function globalMonitoring() {
                 alertEmbed.addFields({ name: `✅ ${service.name}`, value: 'Operations back to normal.' });
             }
             setExtStatus(key, currentStatus);
-            insertHistory.run(key, currentStatus === 'none' ? 'UP' : 'DOWN', latency);
+            insertHistory.run(key, currentStatus === 'none' ? 'UP' : 'DOWN', latency, null);
         } catch (error) { }
     }
+    if (hasChanged) broadcastAlert(alertEmbed, hasProblem);
+}
 
-    const urls = db.prepare(`SELECT id, name, url, manual_incident, ignore_ssl, kind FROM monitored_urls`).all();
-    for (const site of urls) {
+async function monitorGuildWatchlist(guildId, sites) {
+    let hasChanged = false, hasProblem = false;
+    const alertEmbed = createEmbed().setFooter({ text: 'Automated NOC Center' });
+
+    for (const site of sites) {
         if (site.manual_incident) {
-            if (lastStatusMonitoredUrls[site.id] !== 'maintenance') {
+            if (lastStatusMonitoredUrls[localKey(guildId, site.id)] !== 'maintenance') {
                 hasChanged = true; hasProblem = true;
                 alertEmbed.addFields({ name: `🔧 Maintenance: ${site.name}`, value: site.manual_incident });
-                setLocalStatus(site.id, 'maintenance');
+                setLocalStatus(guildId, site.id, 'maintenance');
             }
-            insertHistory.run(site.id, 'DOWN', null);
+            insertHistory.run(site.id, 'DOWN', null, guildId);
             continue;
         }
 
@@ -206,29 +258,28 @@ async function globalMonitoring() {
                 const latency = Date.now() - start;
                 if (data.result === null) continue; // build still running, skip this cycle
 
-                const ok = data.result === 'SUCCESS';
-                if (ok) {
-                    if (lastStatusMonitoredUrls[site.id] === 'down') {
+                if (data.result === 'SUCCESS') {
+                    if (lastStatusMonitoredUrls[localKey(guildId, site.id)] === 'down') {
                         hasChanged = true;
                         alertEmbed.addFields({ name: `✅ Build OK: ${site.name}`, value: `Last build (#${data.number}) passed.` });
                     }
-                    setLocalStatus(site.id, 'up');
-                    insertHistory.run(site.id, 'UP', latency);
+                    setLocalStatus(guildId, site.id, 'up');
+                    insertHistory.run(site.id, 'UP', latency, guildId);
                 } else {
-                    if (lastStatusMonitoredUrls[site.id] !== 'down') {
+                    if (lastStatusMonitoredUrls[localKey(guildId, site.id)] !== 'down') {
                         hasChanged = true; hasProblem = true;
                         alertEmbed.addFields({ name: `🚨 Build Failed: ${site.name}`, value: `Last build (#${data.number}) came back **${data.result}**.` });
                     }
-                    setLocalStatus(site.id, 'down');
-                    insertHistory.run(site.id, 'DOWN', latency);
+                    setLocalStatus(guildId, site.id, 'down');
+                    insertHistory.run(site.id, 'DOWN', latency, guildId);
                 }
             } catch (error) {
-                if (lastStatusMonitoredUrls[site.id] !== 'down') {
+                if (lastStatusMonitoredUrls[localKey(guildId, site.id)] !== 'down') {
                     hasChanged = true; hasProblem = true;
                     alertEmbed.addFields({ name: `🚨 Unreachable: ${site.name}`, value: 'Could not reach the Jenkins job API.' });
                 }
-                setLocalStatus(site.id, 'down');
-                insertHistory.run(site.id, 'DOWN', null);
+                setLocalStatus(guildId, site.id, 'down');
+                insertHistory.run(site.id, 'DOWN', null, guildId);
             }
             continue;
         }
@@ -248,25 +299,35 @@ async function globalMonitoring() {
             await axios.get(site.url, { timeout: 10000 });
             const latency = Date.now() - start;
 
-            if (lastStatusMonitoredUrls[site.id] === 'down') {
+            if (lastStatusMonitoredUrls[localKey(guildId, site.id)] === 'down') {
                 hasChanged = true;
                 alertEmbed.addFields({ name: `✅ Online: ${site.name}`, value: `Connection restored.` });
             }
-            setLocalStatus(site.id, 'up');
-            insertHistory.run(site.id, 'UP', latency);
+            setLocalStatus(guildId, site.id, 'up');
+            insertHistory.run(site.id, 'UP', latency, guildId);
         } catch (error) {
             let reason = 'Connection failure (Timeout/HTTP Error)';
             if (error.message === 'SSL_EXPIRED' || error.code === 'CERT_HAS_EXPIRED') reason = 'Invalid/Expired SSL Certificate';
 
-            if (lastStatusMonitoredUrls[site.id] !== 'down') {
+            if (lastStatusMonitoredUrls[localKey(guildId, site.id)] !== 'down') {
                 hasChanged = true; hasProblem = true;
                 alertEmbed.addFields({ name: `🚨 Offline: ${site.name}`, value: reason });
             }
-            setLocalStatus(site.id, 'down');
-            insertHistory.run(site.id, 'DOWN', null);
+            setLocalStatus(guildId, site.id, 'down');
+            insertHistory.run(site.id, 'DOWN', null, guildId);
         }
     }
-    if (hasChanged) broadcastAlert(alertEmbed, hasProblem);
+    if (hasChanged) broadcastAlert(alertEmbed, hasProblem, guildId);
+}
+
+async function globalMonitoring() {
+    await monitorThirdParty();
+
+    const guildIds = db.prepare(`SELECT DISTINCT guild_id FROM monitored_urls`).all().map(r => r.guild_id);
+    for (const guildId of guildIds) {
+        const sites = db.prepare(`SELECT id, name, url, manual_incident, ignore_ssl, kind FROM monitored_urls WHERE guild_id = ?`).all(guildId);
+        await monitorGuildWatchlist(guildId, sites);
+    }
 }
 
 // ==========================================
@@ -279,57 +340,67 @@ function doConfig(guildId, userTag, channelId, roleIds) {
     return createEmbed(COLORS.success).setDescription(`✅ Configuration saved and linked to <#${channelId}>.`);
 }
 
+// A webhook_id is a global slug (it's part of a public-ish URL), but only the guild that first
+// claims it may repoint or rotate it — otherwise any server running this bot could hijack another
+// team's project by mapping the same id to their own channel.
 function doChannelMap(guildId, userTag, webhookId, channelId) {
-    const existing = db.prepare(`SELECT webhook_key FROM webhook_channels WHERE webhook_id = ?`).get(webhookId);
+    const existing = db.prepare(`SELECT webhook_key, guild_id FROM webhook_channels WHERE webhook_id = ?`).get(webhookId);
+    if (existing?.guild_id && existing.guild_id !== guildId) return { error: 'taken' };
+
     const key = existing?.webhook_key || crypto.randomBytes(16).toString('hex');
-    db.prepare(`INSERT OR REPLACE INTO webhook_channels (webhook_id, channel_id, webhook_key) VALUES (?, ?, ?)`).run(webhookId, channelId, key);
+    db.prepare(`INSERT OR REPLACE INTO webhook_channels (webhook_id, channel_id, webhook_key, guild_id) VALUES (?, ?, ?, ?)`).run(webhookId, channelId, key, guildId);
     logAudit(guildId, userTag, 'channel-map', `${webhookId} -> ${channelId}`);
     return { key, isNew: !existing };
 }
 
 function doChannelRotate(guildId, userTag, webhookId) {
-    const existing = db.prepare(`SELECT channel_id FROM webhook_channels WHERE webhook_id = ?`).get(webhookId);
-    if (!existing) return null;
+    const existing = db.prepare(`SELECT channel_id, guild_id FROM webhook_channels WHERE webhook_id = ?`).get(webhookId);
+    if (!existing) return { error: 'missing' };
+    if (existing.guild_id && existing.guild_id !== guildId) return { error: 'taken' };
+
     const key = crypto.randomBytes(16).toString('hex');
-    db.prepare(`UPDATE webhook_channels SET webhook_key = ? WHERE webhook_id = ?`).run(key, webhookId);
+    db.prepare(`UPDATE webhook_channels SET webhook_key = ?, guild_id = ? WHERE webhook_id = ?`).run(key, guildId, webhookId);
     logAudit(guildId, userTag, 'channel-rotate', webhookId);
-    return key;
+    return { key };
 }
 
 function doMonitor(guildId, userTag, id, url, name, kind = 'url') {
-    db.prepare(`INSERT OR REPLACE INTO monitored_urls (id, name, url, ignore_ssl, kind) VALUES (?, ?, ?, 0, ?)`).run(id, name, url, kind);
-    setLocalStatus(id, 'up');
+    db.prepare(`INSERT OR REPLACE INTO monitored_urls (guild_id, id, name, url, ignore_ssl, kind) VALUES (?, ?, ?, ?, 0, ?)`).run(guildId, id, name, url, kind);
+    setLocalStatus(guildId, id, 'up');
     logAudit(guildId, userTag, 'monitor', `${id} (${kind}) -> ${url}`);
 }
 
 function doRemove(guildId, userTag, id) {
-    const existed = db.prepare(`SELECT 1 FROM monitored_urls WHERE id = ?`).get(id);
-    db.prepare(`DELETE FROM monitored_urls WHERE id = ?`).run(id);
-    db.prepare(`DELETE FROM service_state WHERE id = ?`).run(`local:${id}`);
-    delete lastStatusMonitoredUrls[id];
+    const existed = db.prepare(`SELECT 1 FROM monitored_urls WHERE guild_id = ? AND id = ?`).get(guildId, id);
+    db.prepare(`DELETE FROM monitored_urls WHERE guild_id = ? AND id = ?`).run(guildId, id);
+    db.prepare(`DELETE FROM service_state WHERE id = ?`).run(`local:${localKey(guildId, id)}`);
+    delete lastStatusMonitoredUrls[localKey(guildId, id)];
     logAudit(guildId, userTag, 'remove', id);
     return !!existed;
 }
 
 function doSslIgnore(guildId, userTag, id) {
-    db.prepare(`UPDATE monitored_urls SET ignore_ssl = 1 WHERE id = ?`).run(id);
+    db.prepare(`UPDATE monitored_urls SET ignore_ssl = 1 WHERE guild_id = ? AND id = ?`).run(guildId, id);
     logAudit(guildId, userTag, 'ssl-ignore', id);
 }
 
 function doIncident(guildId, userTag, id, msg) {
-    db.prepare(`UPDATE monitored_urls SET manual_incident = ? WHERE id = ?`).run(msg || 'Maintenance', id);
+    db.prepare(`UPDATE monitored_urls SET manual_incident = ? WHERE guild_id = ? AND id = ?`).run(msg || 'Maintenance', guildId, id);
     logAudit(guildId, userTag, 'incident', `${id}: ${msg || 'Maintenance'}`);
 }
 
 function doResolve(guildId, userTag, id) {
-    db.prepare(`UPDATE monitored_urls SET manual_incident = NULL WHERE id = ?`).run(id);
-    setLocalStatus(id, 'down'); // forces a real re-check next monitoring cycle instead of assuming it's back
+    db.prepare(`UPDATE monitored_urls SET manual_incident = NULL WHERE guild_id = ? AND id = ?`).run(guildId, id);
+    setLocalStatus(guildId, id, 'down'); // forces a real re-check next monitoring cycle instead of assuming it's back
     logAudit(guildId, userTag, 'resolve', id);
 }
 
-function doReport(days) {
+function doReport(guildId, days) {
     const clampedDays = Math.min(90, Math.max(1, days || 7));
-    const records = db.prepare(`SELECT service_id, status, latency_ms FROM uptime_history WHERE timestamp >= datetime('now', '-' || ? || ' days')`).all(clampedDays);
+    const records = db.prepare(`
+        SELECT service_id, status, latency_ms FROM uptime_history
+        WHERE timestamp >= datetime('now', '-' || ? || ' days') AND (guild_id IS NULL OR guild_id = ?)
+    `).all(clampedDays, guildId);
     if (records.length === 0) return createEmbed().setDescription("📊 Collecting baseline data. Check back later.");
 
     const stats = {};
@@ -348,7 +419,7 @@ function doReport(days) {
         const filled = Math.round(percentage / 10);
         const bar = (percentage < 90 ? '🟥' : (percentage < 98 ? '🟨' : '🟩')).repeat(filled) + '⬛'.repeat(10 - filled);
 
-        let name = endpoints[id] ? endpoints[id].name : (db.prepare(`SELECT name FROM monitored_urls WHERE id = ?`).get(id)?.name || id);
+        let name = endpoints[id] ? endpoints[id].name : (db.prepare(`SELECT name FROM monitored_urls WHERE guild_id = ? AND id = ?`).get(guildId, id)?.name || id);
         const avgLatency = data.latencyCount > 0 ? ` · ~${Math.round(data.latencySum / data.latencyCount)}ms` : '';
         const line = `${bar} \`${percentage.padStart(6, ' ')}%\` **${name}**${avgLatency}\n`;
         if (endpoints[id]) thirdPartyText += line; else localText += line;
@@ -429,13 +500,13 @@ function buildStatusAllEmbed(guild) {
     }
 
     let localText = '';
-    const projects = db.prepare(`SELECT id, name, manual_incident FROM monitored_urls`).all();
+    const projects = guild ? db.prepare(`SELECT id, name, manual_incident FROM monitored_urls WHERE guild_id = ?`).all(guild.id) : [];
     if (projects.length > 0) {
         for (const p of projects) {
             if (p.manual_incident) {
                 localText += `🟨 \`${p.name.substring(0,25).padEnd(25, ' ')}\` *(Maintenance)*\n`;
             } else {
-                const isUp = lastStatusMonitoredUrls[p.id] === 'up';
+                const isUp = lastStatusMonitoredUrls[localKey(guild.id, p.id)] === 'up';
                 localText += `${isUp ? '🟩' : '🟥'} \`${p.name.substring(0,25).padEnd(25, ' ')}\`\n`;
             }
         }
@@ -509,7 +580,7 @@ const SLASH_COMMANDS = [
         options: [{ name: 'webhook-id', description: 'Project id', type: 3, required: true }]
     },
     {
-        name: 'monitor', description: 'Add a URL to the watchlist',
+        name: 'monitor', description: 'Add a URL to this server\'s watchlist',
         options: [
             { name: 'id', description: 'Short id for this service', type: 3, required: true },
             { name: 'url', description: 'URL to ping every 5 minutes', type: 3, required: true },
@@ -517,7 +588,7 @@ const SLASH_COMMANDS = [
         ]
     },
     {
-        name: 'monitor-jenkins', description: 'Add a Jenkins job to the watchlist',
+        name: 'monitor-jenkins', description: 'Add a Jenkins job to this server\'s watchlist',
         options: [
             { name: 'id', description: 'Short id for this job', type: 3, required: true },
             { name: 'job-url', description: 'Job base URL (e.g. http://user:pass@jenkins/job/X)', type: 3, required: true },
@@ -525,7 +596,7 @@ const SLASH_COMMANDS = [
         ]
     },
     {
-        name: 'remove', description: 'Remove a project from the watchlist',
+        name: 'remove', description: 'Remove a project from this server\'s watchlist',
         options: [{ name: 'id', description: 'Project id', type: 3, required: true, autocomplete: true }]
     },
     {
@@ -566,8 +637,9 @@ function registerSlashCommands(guild) {
 client.once(Events.ClientReady, () => {
     loadEndpoints();
     for (const key in endpoints) lastStatus[key] = 'none';
-    const urls = db.prepare(`SELECT id FROM monitored_urls`).all();
-    urls.forEach(row => lastStatusMonitoredUrls[row.id] = 'up');
+    for (const row of db.prepare(`SELECT guild_id, id FROM monitored_urls`).all()) {
+        lastStatusMonitoredUrls[localKey(row.guild_id, row.id)] = 'up';
+    }
     loadPersistedState(); // overwrite the optimistic defaults above with whatever we knew before restart
 
     for (const guild of client.guilds.cache.values()) registerSlashCommands(guild);
@@ -602,7 +674,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const focused = interaction.options.getFocused().toLowerCase();
         const choices = interaction.commandName === 'status'
             ? Object.entries(endpoints).map(([id, s]) => ({ name: s.name, value: id }))
-            : db.prepare(`SELECT id, name FROM monitored_urls`).all().map(r => ({ name: `${r.name} (${r.id})`, value: r.id }));
+            : db.prepare(`SELECT id, name FROM monitored_urls WHERE guild_id = ?`).all(interaction.guildId).map(r => ({ name: `${r.name} (${r.id})`, value: r.id }));
         const filtered = choices.filter(c => c.value.toLowerCase().includes(focused) || c.name.toLowerCase().includes(focused)).slice(0, 25);
         return interaction.respond(filtered).catch(() => {});
     }
@@ -647,9 +719,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
             if (!isManager()) return interaction.reply({ content: '❌ Access denied.', ephemeral: true });
             const webhookId = interaction.options.getString('webhook-id').toLowerCase();
             const channel = interaction.options.getChannel('channel');
-            const { key, isNew } = doChannelMap(guildId, user.tag, webhookId, channel.id);
+            const result = doChannelMap(guildId, user.tag, webhookId, channel.id);
+            if (result.error === 'taken') return interaction.reply({ content: `❌ \`${webhookId}\` is already owned by another server.`, ephemeral: true });
             return interaction.reply({
-                content: `✅ Webhooks for \`${webhookId}\` now land in ${channel}.\n${isNew ? `🔑 API key (save it, only shown again with \`/channel-rotate\`): \`${key}\`` : `🔑 API key unchanged: \`${key}\``}`,
+                content: `✅ Webhooks for \`${webhookId}\` now land in ${channel}.\n${result.isNew ? `🔑 API key (save it, only shown again with \`/channel-rotate\`): \`${result.key}\`` : `🔑 API key unchanged: \`${result.key}\``}`,
                 ephemeral: true
             });
         }
@@ -657,9 +730,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (commandName === 'channel-rotate') {
             if (!isManager()) return interaction.reply({ content: '❌ Access denied.', ephemeral: true });
             const webhookId = interaction.options.getString('webhook-id').toLowerCase();
-            const key = doChannelRotate(guildId, user.tag, webhookId);
-            if (!key) return interaction.reply({ content: `⚠️ No channel mapped for \`${webhookId}\` yet. Use \`/channel\` first.`, ephemeral: true });
-            return interaction.reply({ content: `🔑 New API key for \`${webhookId}\`: \`${key}\` (old one stopped working).`, ephemeral: true });
+            const result = doChannelRotate(guildId, user.tag, webhookId);
+            if (result.error === 'missing') return interaction.reply({ content: `⚠️ No channel mapped for \`${webhookId}\` yet. Use \`/channel\` first.`, ephemeral: true });
+            if (result.error === 'taken') return interaction.reply({ content: `❌ \`${webhookId}\` is owned by another server.`, ephemeral: true });
+            return interaction.reply({ content: `🔑 New API key for \`${webhookId}\`: \`${result.key}\` (old one stopped working).`, ephemeral: true });
         }
 
         if (commandName === 'monitor' || commandName === 'monitor-jenkins') {
@@ -703,7 +777,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         if (commandName === 'report') {
-            const embed = doReport(interaction.options.getInteger('days'));
+            const embed = doReport(guildId, interaction.options.getInteger('days'));
             return interaction.reply({ embeds: [embed] });
         }
 
@@ -768,7 +842,7 @@ function buildHelpPanel() {
     const embed = createEmbed()
         .setTitle('📚 NOC Bot Documentation')
         .setThumbnail(client.user.displayAvatarURL())
-        .setDescription('Pick a category below to see detailed commands, examples and required permissions.\nEvery command also exists as a slash command (`/status`, `/monitor`, ...).')
+        .setDescription('Pick a category below to see detailed commands, examples and required permissions.\nEvery command also exists as a slash command (`/status`, `/monitor`, ...). Each server has its own watchlist and webhooks — nothing is shared between servers except the third-party status catalog.')
         .setFooter({ text: 'Monitoring & DevOps Center' });
     return { embed, row };
 }
@@ -798,10 +872,10 @@ function attachHelpCollector(msgHelp, authorId) {
                 );
         } else if (i.customId === 'help_local') {
             newEmbed.setTitle('💻 Local Projects & Management')
-                .setDescription('Commands restricted to **Administrators** and **Manager Roles**.')
+                .setDescription('Commands restricted to **Administrators** and **Manager Roles**. Your watchlist is private to this server.')
                 .addFields(
                     { name: 'Add a URL to the Watchlist', value: 'Pings the URL every 5 minutes and checks SSL (if HTTPS).\n```bash\n!monitor <id> <url> <Display Name>\n```' },
-                    { name: 'Add a Jenkins Job', value: 'Polls `<job-url>/lastBuild/api/json` every 5 minutes. Put basic auth in the URL if needed: `http://user:pass@jenkins/job/X`.\n```bash\n!monitor-jenkins <id> <job_url> <Display Name>\n```' },
+                    { name: 'Add a Jenkins Job', value: 'Polls `<job-url>/lastBuild/api/json` every 5 minutes. Put basic auth in the URL if needed: `http://user:pass@jenkins-host/job/X`.\n```bash\n!monitor-jenkins <id> <job_url> <Display Name>\n```' },
                     { name: 'Disable SSL Check', value: '```bash\n!ssl ignore <id>\n```' },
                     { name: 'Open a Maintenance Incident', value: 'Pauses monitoring while you update your system.\n```bash\n!incident <id> <Message>\n```' },
                     { name: 'Resolve / Remove', value: '`!remove` asks for confirmation before deleting.\n```bash\n!resolve <id>\n!remove <id>\n```' },
@@ -812,7 +886,7 @@ function attachHelpCollector(msgHelp, authorId) {
                 .setDescription('The bot runs an Express server on port 3000 to receive payloads from any CI/CD pipeline (GitHub Actions, AWS, Jenkins).')
                 .addFields(
                     { name: 'POST Structure (JSON)', value: 'Send the request to `http://<bot-ip>:3000/webhook/<project_id>` with the header `X-API-KEY: <key>`\n```json\n{\n  "title": "CloudWatch Alert",\n  "message": "CPU usage hit 90% on the Web Server.",\n  "status": "error" \n}\n```' },
-                    { name: 'Channel per Project', value: 'Maps a project to its own channel AND generates a dedicated API key for it (safer than sharing the global `.env` key across every project).\n```bash\n!channel <project_id> #channel\n!channel rotate <project_id>\n```' },
+                    { name: 'Channel per Project', value: 'Maps a project to its own channel AND issues it a dedicated API key. Once a server claims a `project_id`, only that server can remap or rotate it — other servers can\'t hijack it by reusing the same id.\n```bash\n!channel <project_id> #channel\n!channel rotate <project_id>\n```' },
                     { name: 'Test it', value: '```bash\n!webhook test <project_id>\n```' }
                 );
         }
@@ -863,17 +937,19 @@ client.on('messageCreate', async (message) => {
         if (args[1] === 'rotate') {
             const webhookId = args[2]?.toLowerCase();
             if (!webhookId) return message.reply('⚠️ Usage: `!channel rotate <webhook_id>`');
-            const key = doChannelRotate(message.guild.id, message.author.tag, webhookId);
-            if (!key) return message.reply(`⚠️ No channel mapped for \`${webhookId}\` yet. Use \`!channel <id> #channel\` first.`);
-            return message.reply(`🔑 New API key for \`${webhookId}\`: \`${key}\` (old one stopped working).`);
+            const result = doChannelRotate(message.guild.id, message.author.tag, webhookId);
+            if (result.error === 'missing') return message.reply(`⚠️ No channel mapped for \`${webhookId}\` yet. Use \`!channel <id> #channel\` first.`);
+            if (result.error === 'taken') return message.reply(`❌ \`${webhookId}\` is owned by another server.`);
+            return message.reply(`🔑 New API key for \`${webhookId}\`: \`${result.key}\` (old one stopped working).`);
         }
 
         const webhookId = args[1]?.toLowerCase();
         const channel = message.mentions.channels.first();
         if (!webhookId || !channel) return message.reply('⚠️ Usage: `!channel <webhook_id> #channel`');
 
-        const { key, isNew } = doChannelMap(message.guild.id, message.author.tag, webhookId, channel.id);
-        return message.reply(`✅ Webhooks for \`${webhookId}\` (\`http://<bot-ip>:3000/webhook/${webhookId}\`) now land in ${channel}.\n${isNew ? `🔑 API key (save it, only shown again with \`!channel rotate\`): \`${key}\`` : `🔑 API key unchanged: \`${key}\``}`);
+        const result = doChannelMap(message.guild.id, message.author.tag, webhookId, channel.id);
+        if (result.error === 'taken') return message.reply(`❌ \`${webhookId}\` is already owned by another server.`);
+        return message.reply(`✅ Webhooks for \`${webhookId}\` (\`http://<bot-ip>:3000/webhook/${webhookId}\`) now land in ${channel}.\n${result.isNew ? `🔑 API key (save it, only shown again with \`!channel rotate\`): \`${result.key}\`` : `🔑 API key unchanged: \`${result.key}\``}`);
     }
 
     if (command === '!webhook' && args[1] === 'test') {
@@ -927,7 +1003,7 @@ client.on('messageCreate', async (message) => {
     // --- DASHBOARDS & REPORTS ---
     if (command === '!report') {
         const days = args[1] ? parseInt(args[1], 10) : 7;
-        return message.channel.send({ embeds: [doReport(days)] });
+        return message.channel.send({ embeds: [doReport(message.guild.id, days)] });
     }
 
     if (command === '!status') {

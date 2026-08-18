@@ -4,6 +4,8 @@ Discord bot for a dev team's infrastructure monitoring: tracks the status of thi
 
 Every command exists both as `!text` and as a `/slash` command with autocomplete.
 
+**Multi-server:** the third-party status catalog (`endpoints.json`) is shared, but each server's watchlist, webhook mappings and audit log are isolated — two servers can both use a project id like `api` without colliding, and a `webhook_id` is owned by whichever server claimed it first (another server can't hijack it by reusing the same id in `!channel`).
+
 ## Setup
 
 ```bash
