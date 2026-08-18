@@ -1,0 +1,97 @@
+{
+  "github": {
+    "nome": "GitHub",
+    "url": "https://www.githubstatus.com/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "openai": {
+    "nome": "OpenAI",
+    "url": "https://status.openai.com/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "cloudflare": {
+    "nome": "Cloudflare",
+    "url": "https://www.cloudflarestatus.com/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "anthropic": {
+    "nome": "Anthropic",
+    "url": "https://status.anthropic.com/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "vercel": {
+    "nome": "Vercel",
+    "url": "https://www.vercel-status.com/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "docker": {
+    "nome": "Docker",
+    "url": "https://status.docker.com/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "npm": {
+    "nome": "NPM",
+    "url": "https://status.npmjs.org/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "pypi": {
+    "nome": "PyPI",
+    "url": "https://status.python.org/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "discord": {
+    "nome": "Discord API",
+    "url": "https://discordstatus.com/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "render": {
+    "nome": "Render",
+    "url": "https://status.render.com/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "aws": {
+    "nome": "AWS API Gateway & Lambda",
+    "url": "https://stoplight.io/api/v1/status.json",
+    "tipo": "atlassian"
+  },
+  "supabase": {
+    "nome": "Supabase (BaaS)",
+    "url": "https://status.supabase.com/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "planetscale": {
+    "nome": "PlanetScale (MySQL)",
+    "url": "https://www.planetscalestatus.com/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "redis": {
+    "nome": "Redis Labs",
+    "url": "https://status.redislabs.com/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "stripe": {
+    "nome": "Stripe (Pagamentos)",
+    "url": "https://status.stripe.com/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "railway": {
+    "nome": "Railway (Hospedagem)",
+    "url": "https://status.railway.app/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "huggingface": {
+    "nome": "Hugging Face (IA)",
+    "url": "https://status.huggingface.co/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "postman": {
+    "nome": "Postman",
+    "url": "https://status.postman.com/api/v2/status.json",
+    "tipo": "atlassian"
+  },
+  "sentry": {
+    "nome": "Sentry (Logs/Erros)",
+    "url": "https://status.sentry.io/api/v2/status.json",
+    "tipo": "atlassian"
+  }
+}
