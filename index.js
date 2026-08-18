@@ -1,6 +1,7 @@
 const { Client, GatewayIntentBits, PermissionsBitField, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle, ComponentType, Events } = require('discord.js');
 const axios = require('axios');
 const fs = require('fs');
+const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const express = require('express');
 const cors = require('cors');
@@ -44,7 +45,26 @@ db.exec(`
         webhook_id TEXT PRIMARY KEY,
         channel_id TEXT
     );
+    CREATE TABLE IF NOT EXISTS service_state (
+        id TEXT PRIMARY KEY,
+        status TEXT
+    );
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT,
+        user_tag TEXT,
+        action TEXT,
+        details TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
 `);
+
+// Columns added after the initial release — ignore "duplicate column" on installs that already have them.
+for (const stmt of [
+    `ALTER TABLE monitored_urls ADD COLUMN kind TEXT DEFAULT 'url'`,
+    `ALTER TABLE webhook_channels ADD COLUMN webhook_key TEXT`,
+    `ALTER TABLE uptime_history ADD COLUMN latency_ms INTEGER`
+]) { try { db.exec(stmt); } catch (e) { /* column already exists */ } }
 
 let endpoints = {};
 let lastStatus = {};
@@ -68,31 +88,29 @@ function loadEndpoints() {
     } catch (e) { console.error(e); }
 }
 
+// Status survives a restart: every write goes through these two setters instead of touching the
+// in-memory maps directly, so a crash/redeploy doesn't silently forget an ongoing outage.
+const upsertState = db.prepare(`INSERT OR REPLACE INTO service_state (id, status) VALUES (?, ?)`);
+function setExtStatus(key, status) { lastStatus[key] = status; upsertState.run(`ext:${key}`, status); }
+function setLocalStatus(id, status) { lastStatusMonitoredUrls[id] = status; upsertState.run(`local:${id}`, status); }
+function loadPersistedState() {
+    for (const row of db.prepare(`SELECT id, status FROM service_state`).all()) {
+        if (row.id.startsWith('ext:')) lastStatus[row.id.slice(4)] = row.status;
+        else if (row.id.startsWith('local:')) lastStatusMonitoredUrls[row.id.slice(6)] = row.status;
+    }
+}
+
 const axiosConfig = {
     headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' }
 };
 
-client.once(Events.ClientReady, () => {
-    loadEndpoints();
-    for (const key in endpoints) lastStatus[key] = 'none';
-
-    const urls = db.prepare(`SELECT id FROM monitored_urls`).all();
-    urls.forEach(row => lastStatusMonitoredUrls[row.id] = 'up');
-
-    console.log(`✅ NOC Bot online! Logged in as ${client.user.tag}`);
-    globalMonitoring();
-    setInterval(globalMonitoring, 300000);
-
-    app.listen(3000, () => console.log('🌐 Webhook server active on port 3000'));
-});
-
 // ==========================================
 // 2. SUPPORT FUNCTIONS
 // ==========================================
-function hasPermission(message, guildId) {
-    if (message.member?.permissions.has(PermissionsBitField.Flags.Administrator)) return true;
+function hasPermission(member, guildId) {
+    if (member?.permissions.has(PermissionsBitField.Flags.Administrator)) return true;
     const config = db.prepare(`SELECT admin_role FROM guild_configs WHERE guild_id = ?`).get(guildId);
-    if (config && config.admin_role && message.member?.roles.cache.has(config.admin_role)) return true;
+    if (config && config.admin_role && member?.roles.cache.has(config.admin_role)) return true;
     return false;
 }
 
@@ -104,6 +122,11 @@ function createEmbed(color = COLORS.neutral) {
         .setColor(color)
         .setAuthor({ name: 'NOC Bot', iconURL: client.user.displayAvatarURL() })
         .setTimestamp();
+}
+
+const insertAudit = db.prepare(`INSERT INTO audit_log (guild_id, user_tag, action, details) VALUES (?, ?, ?, ?)`);
+function logAudit(guildId, userTag, action, details) {
+    try { insertAudit.run(guildId || 'unknown', userTag, action, details || ''); } catch (e) { /* best effort */ }
 }
 
 function broadcastAlert(alertEmbed, hasProblem) {
@@ -121,6 +144,19 @@ function broadcastAlert(alertEmbed, hasProblem) {
     }
 }
 
+function dispatchWebhookAlert(webhookId, title, msg, hasProblem) {
+    const hookEmbed = createEmbed(hasProblem ? COLORS.danger : COLORS.info)
+        .setTitle(`📡 Webhook [${webhookId}]: ${title || 'External Alert'}`)
+        .setDescription(msg || 'Event received.');
+
+    const projectChannel = db.prepare(`SELECT channel_id FROM webhook_channels WHERE webhook_id = ?`).get(webhookId);
+    if (projectChannel) {
+        client.channels.fetch(projectChannel.channel_id).then(channel => channel?.send({ embeds: [hookEmbed] })).catch(() => {});
+    } else {
+        broadcastAlert(hookEmbed, hasProblem);
+    }
+}
+
 // ==========================================
 // 3. GLOBAL MONITORING ENGINE
 // ==========================================
@@ -128,12 +164,14 @@ async function globalMonitoring() {
     let hasChanged = false;
     const alertEmbed = createEmbed().setFooter({ text: 'Automated NOC Center' });
     let hasProblem = false;
-    const insertHistory = db.prepare(`INSERT INTO uptime_history (service_id, status) VALUES (?, ?)`);
+    const insertHistory = db.prepare(`INSERT INTO uptime_history (service_id, status, latency_ms) VALUES (?, ?, ?)`);
 
     for (const [key, service] of Object.entries(endpoints)) {
         try {
             if (service.type !== 'atlassian') continue;
+            const start = Date.now();
             const response = await axios.get(service.url, axiosConfig);
+            const latency = Date.now() - start;
             const currentStatus = response.data.status.indicator;
 
             if (!lastStatus[key]) lastStatus[key] = 'none';
@@ -144,20 +182,54 @@ async function globalMonitoring() {
                 hasChanged = true;
                 alertEmbed.addFields({ name: `✅ ${service.name}`, value: 'Operations back to normal.' });
             }
-            lastStatus[key] = currentStatus;
-            insertHistory.run(key, currentStatus === 'none' ? 'UP' : 'DOWN');
+            setExtStatus(key, currentStatus);
+            insertHistory.run(key, currentStatus === 'none' ? 'UP' : 'DOWN', latency);
         } catch (error) { }
     }
 
-    const urls = db.prepare(`SELECT id, name, url, manual_incident, ignore_ssl FROM monitored_urls`).all();
+    const urls = db.prepare(`SELECT id, name, url, manual_incident, ignore_ssl, kind FROM monitored_urls`).all();
     for (const site of urls) {
         if (site.manual_incident) {
             if (lastStatusMonitoredUrls[site.id] !== 'maintenance') {
                 hasChanged = true; hasProblem = true;
                 alertEmbed.addFields({ name: `🔧 Maintenance: ${site.name}`, value: site.manual_incident });
-                lastStatusMonitoredUrls[site.id] = 'maintenance';
+                setLocalStatus(site.id, 'maintenance');
             }
-            insertHistory.run(site.id, 'DOWN');
+            insertHistory.run(site.id, 'DOWN', null);
+            continue;
+        }
+
+        if (site.kind === 'jenkins') {
+            try {
+                const start = Date.now();
+                const { data } = await axios.get(`${site.url.replace(/\/+$/, '')}/lastBuild/api/json`, { timeout: 10000 });
+                const latency = Date.now() - start;
+                if (data.result === null) continue; // build still running, skip this cycle
+
+                const ok = data.result === 'SUCCESS';
+                if (ok) {
+                    if (lastStatusMonitoredUrls[site.id] === 'down') {
+                        hasChanged = true;
+                        alertEmbed.addFields({ name: `✅ Build OK: ${site.name}`, value: `Last build (#${data.number}) passed.` });
+                    }
+                    setLocalStatus(site.id, 'up');
+                    insertHistory.run(site.id, 'UP', latency);
+                } else {
+                    if (lastStatusMonitoredUrls[site.id] !== 'down') {
+                        hasChanged = true; hasProblem = true;
+                        alertEmbed.addFields({ name: `🚨 Build Failed: ${site.name}`, value: `Last build (#${data.number}) came back **${data.result}**.` });
+                    }
+                    setLocalStatus(site.id, 'down');
+                    insertHistory.run(site.id, 'DOWN', latency);
+                }
+            } catch (error) {
+                if (lastStatusMonitoredUrls[site.id] !== 'down') {
+                    hasChanged = true; hasProblem = true;
+                    alertEmbed.addFields({ name: `🚨 Unreachable: ${site.name}`, value: 'Could not reach the Jenkins job API.' });
+                }
+                setLocalStatus(site.id, 'down');
+                insertHistory.run(site.id, 'DOWN', null);
+            }
             continue;
         }
 
@@ -172,14 +244,16 @@ async function globalMonitoring() {
                     throw new Error("SSL_EXPIRED");
                 }
             }
+            const start = Date.now();
             await axios.get(site.url, { timeout: 10000 });
+            const latency = Date.now() - start;
 
             if (lastStatusMonitoredUrls[site.id] === 'down') {
                 hasChanged = true;
                 alertEmbed.addFields({ name: `✅ Online: ${site.name}`, value: `Connection restored.` });
             }
-            lastStatusMonitoredUrls[site.id] = 'up';
-            insertHistory.run(site.id, 'UP');
+            setLocalStatus(site.id, 'up');
+            insertHistory.run(site.id, 'UP', latency);
         } catch (error) {
             let reason = 'Connection failure (Timeout/HTTP Error)';
             if (error.message === 'SSL_EXPIRED' || error.code === 'CERT_HAS_EXPIRED') reason = 'Invalid/Expired SSL Certificate';
@@ -188,101 +262,587 @@ async function globalMonitoring() {
                 hasChanged = true; hasProblem = true;
                 alertEmbed.addFields({ name: `🚨 Offline: ${site.name}`, value: reason });
             }
-            lastStatusMonitoredUrls[site.id] = 'down';
-            insertHistory.run(site.id, 'DOWN');
+            setLocalStatus(site.id, 'down');
+            insertHistory.run(site.id, 'DOWN', null);
         }
     }
     if (hasChanged) broadcastAlert(alertEmbed, hasProblem);
 }
 
 // ==========================================
-// 4. WEBHOOKS
+// 4. SHARED COMMAND LOGIC (used by both !commands and /slash commands)
+// ==========================================
+function doConfig(guildId, userTag, channelId, roleIds) {
+    db.prepare(`INSERT OR REPLACE INTO guild_configs (guild_id, channel_id, alert_role, admin_role) VALUES (?, ?, ?, ?)`)
+        .run(guildId, channelId, roleIds[0] || null, roleIds[1] || null);
+    logAudit(guildId, userTag, 'config', `channel=${channelId}`);
+    return createEmbed(COLORS.success).setDescription(`✅ Configuration saved and linked to <#${channelId}>.`);
+}
+
+function doChannelMap(guildId, userTag, webhookId, channelId) {
+    const existing = db.prepare(`SELECT webhook_key FROM webhook_channels WHERE webhook_id = ?`).get(webhookId);
+    const key = existing?.webhook_key || crypto.randomBytes(16).toString('hex');
+    db.prepare(`INSERT OR REPLACE INTO webhook_channels (webhook_id, channel_id, webhook_key) VALUES (?, ?, ?)`).run(webhookId, channelId, key);
+    logAudit(guildId, userTag, 'channel-map', `${webhookId} -> ${channelId}`);
+    return { key, isNew: !existing };
+}
+
+function doChannelRotate(guildId, userTag, webhookId) {
+    const existing = db.prepare(`SELECT channel_id FROM webhook_channels WHERE webhook_id = ?`).get(webhookId);
+    if (!existing) return null;
+    const key = crypto.randomBytes(16).toString('hex');
+    db.prepare(`UPDATE webhook_channels SET webhook_key = ? WHERE webhook_id = ?`).run(key, webhookId);
+    logAudit(guildId, userTag, 'channel-rotate', webhookId);
+    return key;
+}
+
+function doMonitor(guildId, userTag, id, url, name, kind = 'url') {
+    db.prepare(`INSERT OR REPLACE INTO monitored_urls (id, name, url, ignore_ssl, kind) VALUES (?, ?, ?, 0, ?)`).run(id, name, url, kind);
+    setLocalStatus(id, 'up');
+    logAudit(guildId, userTag, 'monitor', `${id} (${kind}) -> ${url}`);
+}
+
+function doRemove(guildId, userTag, id) {
+    const existed = db.prepare(`SELECT 1 FROM monitored_urls WHERE id = ?`).get(id);
+    db.prepare(`DELETE FROM monitored_urls WHERE id = ?`).run(id);
+    db.prepare(`DELETE FROM service_state WHERE id = ?`).run(`local:${id}`);
+    delete lastStatusMonitoredUrls[id];
+    logAudit(guildId, userTag, 'remove', id);
+    return !!existed;
+}
+
+function doSslIgnore(guildId, userTag, id) {
+    db.prepare(`UPDATE monitored_urls SET ignore_ssl = 1 WHERE id = ?`).run(id);
+    logAudit(guildId, userTag, 'ssl-ignore', id);
+}
+
+function doIncident(guildId, userTag, id, msg) {
+    db.prepare(`UPDATE monitored_urls SET manual_incident = ? WHERE id = ?`).run(msg || 'Maintenance', id);
+    logAudit(guildId, userTag, 'incident', `${id}: ${msg || 'Maintenance'}`);
+}
+
+function doResolve(guildId, userTag, id) {
+    db.prepare(`UPDATE monitored_urls SET manual_incident = NULL WHERE id = ?`).run(id);
+    setLocalStatus(id, 'down'); // forces a real re-check next monitoring cycle instead of assuming it's back
+    logAudit(guildId, userTag, 'resolve', id);
+}
+
+function doReport(days) {
+    const clampedDays = Math.min(90, Math.max(1, days || 7));
+    const records = db.prepare(`SELECT service_id, status, latency_ms FROM uptime_history WHERE timestamp >= datetime('now', '-' || ? || ' days')`).all(clampedDays);
+    if (records.length === 0) return createEmbed().setDescription("📊 Collecting baseline data. Check back later.");
+
+    const stats = {};
+    records.forEach(r => {
+        if (!stats[r.service_id]) stats[r.service_id] = { up: 0, total: 0, latencySum: 0, latencyCount: 0 };
+        stats[r.service_id].total++;
+        if (r.status === 'UP') stats[r.service_id].up++;
+        if (r.latency_ms != null) { stats[r.service_id].latencySum += r.latency_ms; stats[r.service_id].latencyCount++; }
+    });
+
+    const embed = createEmbed().setTitle(`📈 Uptime — Last ${clampedDays}d`).setFooter({ text: '🟩 ≥98%  🟨 ≥90%  🟥 <90%' });
+    let thirdPartyText = '', localText = '';
+
+    for (const [id, data] of Object.entries(stats)) {
+        const percentage = ((data.up / data.total) * 100).toFixed(2);
+        const filled = Math.round(percentage / 10);
+        const bar = (percentage < 90 ? '🟥' : (percentage < 98 ? '🟨' : '🟩')).repeat(filled) + '⬛'.repeat(10 - filled);
+
+        let name = endpoints[id] ? endpoints[id].name : (db.prepare(`SELECT name FROM monitored_urls WHERE id = ?`).get(id)?.name || id);
+        const avgLatency = data.latencyCount > 0 ? ` · ~${Math.round(data.latencySum / data.latencyCount)}ms` : '';
+        const line = `${bar} \`${percentage.padStart(6, ' ')}%\` **${name}**${avgLatency}\n`;
+        if (endpoints[id]) thirdPartyText += line; else localText += line;
+    }
+
+    if (thirdPartyText) embed.addFields({ name: 'Third-Party', value: thirdPartyText });
+    if (localText) embed.addFields({ name: 'Local', value: localText });
+    return embed;
+}
+
+async function buildAuditEmbed(service) {
+    const embed = createEmbed().setTitle(`🔍 Audit: ${service.name}`);
+    try {
+        // summary.json covers both open incidents AND in-progress scheduled maintenance —
+        // incidents.json alone misses maintenance windows, which can also flip the indicator.
+        const response = await axios.get(service.url.replace('status.json', 'summary.json'), axiosConfig);
+        const incident = response.data.incidents.find(inc => inc.status !== 'resolved');
+        const maintenance = response.data.scheduled_maintenances.find(m => m.status === 'in_progress');
+        const event = incident || maintenance;
+        embed.setColor(event ? COLORS.danger : COLORS.success);
+        if (!event) embed.setDescription('🟢 No anomalies reported.');
+        else {
+            const icon = incident ? '⚠️' : '🔧';
+            embed.setDescription(`${icon} **${event.name}**\n${event.incident_updates.slice(0, 2).map(up => `> **[${up.status.toUpperCase()}]** - ${up.body}`).join('\n\n')}`);
+        }
+    } catch (e) {
+        embed.setColor(COLORS.neutral).setDescription('⚠️ Could not reach the status provider.');
+    }
+    return embed;
+}
+
+function buildAuditLogEmbed(guildId) {
+    const rows = db.prepare(`SELECT user_tag, action, details, timestamp FROM audit_log WHERE guild_id = ? ORDER BY id DESC LIMIT 10`).all(guildId);
+    const embed = createEmbed().setTitle('🗒️ Recent Admin Actions');
+    if (rows.length === 0) return embed.setDescription('No actions logged yet.');
+    embed.setDescription(rows.map(r => {
+        const ts = Math.floor(new Date(`${r.timestamp}Z`).getTime() / 1000);
+        return `**${r.action}** by ${r.user_tag}${r.details ? ` — ${r.details}` : ''}\n<t:${ts}:R>`;
+    }).join('\n\n'));
+    return embed;
+}
+
+const STACKS = {
+    '☁️ Cloud & Infra': ['cloudflare', 'vercel', 'docker', 'render', 'railway', 'aws'],
+    '🗄️ Databases & Backend': ['supabase', 'planetscale', 'redis'],
+    '🧠 AI': ['openai', 'anthropic', 'huggingface'],
+    '🛠️ DevTools & APIs': ['github', 'npm', 'pypi', 'discord', 'postman', 'sentry'],
+    '💳 Payments': ['stripe']
+};
+
+function buildStatusAllEmbed(guild) {
+    const panelEmbed = createEmbed()
+        .setTitle('🌐 Global Operations Dashboard')
+        .setDescription('Instant status of the dev watchlist, grouped by stack.')
+        .setThumbnail(guild?.iconURL() || client.user.displayAvatarURL())
+        .setFooter({ text: '🟩 Operational   🟨 Minor issue   🟥 Major/Critical outage' });
+
+    const formatLine = (key, service) => {
+        const status = lastStatus[key];
+        const emoji = status === 'none' ? '🟩' : status === 'minor' ? '🟨' : '🟥';
+        let shortName = service.name.substring(0, 18);
+        if (service.name.length > 18) shortName += '..';
+        return `${emoji} \`${shortName.padEnd(20, ' ')}\`\n`;
+    };
+
+    const panels = {};
+    for (const [key, service] of Object.entries(endpoints)) {
+        let foundStack = '🧩 Other Services';
+        for (const [stackName, keyList] of Object.entries(STACKS)) {
+            if (keyList.includes(key)) { foundStack = stackName; break; }
+        }
+        if (!panels[foundStack]) panels[foundStack] = '';
+        panels[foundStack] += formatLine(key, service);
+    }
+
+    for (const [stack, text] of Object.entries(panels)) {
+        panelEmbed.addFields({ name: stack, value: text, inline: true });
+    }
+
+    let localText = '';
+    const projects = db.prepare(`SELECT id, name, manual_incident FROM monitored_urls`).all();
+    if (projects.length > 0) {
+        for (const p of projects) {
+            if (p.manual_incident) {
+                localText += `🟨 \`${p.name.substring(0,25).padEnd(25, ' ')}\` *(Maintenance)*\n`;
+            } else {
+                const isUp = lastStatusMonitoredUrls[p.id] === 'up';
+                localText += `${isUp ? '🟩' : '🟥'} \`${p.name.substring(0,25).padEnd(25, ' ')}\`\n`;
+            }
+        }
+    } else {
+        localText = '```\nNo local project on the watchlist.\n```';
+    }
+
+    panelEmbed.addFields(
+        { name: '​', value: '​', inline: false },
+        { name: '💻 Your Local Applications', value: localText, inline: false }
+    );
+
+    return panelEmbed;
+}
+
+function refreshButtonRow() {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('refresh_status_all').setLabel('Refresh').setEmoji('🔄').setStyle(ButtonStyle.Secondary)
+    );
+}
+
+// Discord select menus hard-cap at 25 options — paginate instead of silently truncating the list.
+function buildStatusSelectRows(page = 0) {
+    const allIds = Object.entries(endpoints);
+    const pageIds = allIds.slice(page * 25, page * 25 + 25);
+    const menu = new StringSelectMenuBuilder().setCustomId(`sel_status:${page}`).setPlaceholder('Audit a service...')
+        .addOptions(pageIds.map(([id, s]) => ({ label: s.name, value: id })));
+    const rows = [new ActionRowBuilder().addComponents(menu)];
+
+    const totalPages = Math.ceil(allIds.length / 25);
+    if (totalPages > 1) {
+        rows.push(new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`status_page:${page - 1}`).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary).setDisabled(page <= 0),
+            new ButtonBuilder().setCustomId(`status_page:${page + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled(page >= totalPages - 1)
+        ));
+    }
+    return rows;
+}
+
+// ==========================================
+// 5. SLASH COMMANDS
+// ==========================================
+const SLASH_COMMANDS = [
+    { name: 'help', description: 'Show the interactive documentation panel' },
+    {
+        name: 'status', description: 'Check service status',
+        options: [
+            { name: 'all', description: 'Full dashboard of every service', type: 1 },
+            { name: 'service', description: 'Audit one specific service', type: 1, options: [
+                { name: 'name', description: 'Service to audit', type: 3, required: true, autocomplete: true }
+            ] }
+        ]
+    },
+    {
+        name: 'config', description: '[Admin] Set the alert channel and roles',
+        options: [
+            { name: 'channel', description: 'Where alerts get posted', type: 7, required: true },
+            { name: 'alert-role', description: 'Role pinged on an outage', type: 8, required: false },
+            { name: 'admin-role', description: 'Role allowed to manage the watchlist', type: 8, required: false }
+        ]
+    },
+    {
+        name: 'channel', description: 'Route a project\'s webhooks to a specific channel',
+        options: [
+            { name: 'webhook-id', description: 'Project id used in the webhook URL', type: 3, required: true },
+            { name: 'channel', description: 'Target channel', type: 7, required: true }
+        ]
+    },
+    {
+        name: 'channel-rotate', description: 'Rotate a project\'s webhook API key',
+        options: [{ name: 'webhook-id', description: 'Project id', type: 3, required: true }]
+    },
+    {
+        name: 'monitor', description: 'Add a URL to the watchlist',
+        options: [
+            { name: 'id', description: 'Short id for this service', type: 3, required: true },
+            { name: 'url', description: 'URL to ping every 5 minutes', type: 3, required: true },
+            { name: 'name', description: 'Display name', type: 3, required: true }
+        ]
+    },
+    {
+        name: 'monitor-jenkins', description: 'Add a Jenkins job to the watchlist',
+        options: [
+            { name: 'id', description: 'Short id for this job', type: 3, required: true },
+            { name: 'job-url', description: 'Job base URL (e.g. http://user:pass@jenkins/job/X)', type: 3, required: true },
+            { name: 'name', description: 'Display name', type: 3, required: true }
+        ]
+    },
+    {
+        name: 'remove', description: 'Remove a project from the watchlist',
+        options: [{ name: 'id', description: 'Project id', type: 3, required: true, autocomplete: true }]
+    },
+    {
+        name: 'ssl-ignore', description: 'Disable SSL expiry checks for a project',
+        options: [{ name: 'id', description: 'Project id', type: 3, required: true, autocomplete: true }]
+    },
+    {
+        name: 'incident', description: 'Open a manual maintenance window for a project',
+        options: [
+            { name: 'id', description: 'Project id', type: 3, required: true, autocomplete: true },
+            { name: 'message', description: 'Reason shown in the alert', type: 3, required: false }
+        ]
+    },
+    {
+        name: 'resolve', description: 'Close a project\'s maintenance window',
+        options: [{ name: 'id', description: 'Project id', type: 3, required: true, autocomplete: true }]
+    },
+    {
+        name: 'report', description: 'Uptime report',
+        options: [{ name: 'days', description: 'How many days back (1-90, default 7)', type: 4, required: false, min_value: 1, max_value: 90 }]
+    },
+    {
+        name: 'webhook-test', description: '[Admin] Send a test alert through a project\'s webhook',
+        options: [{ name: 'id', description: 'Project id', type: 3, required: true }]
+    },
+    { name: 'audit', description: '[Admin] Show the last 10 admin actions on this server' }
+];
+
+function registerSlashCommands(guild) {
+    guild.commands.set(SLASH_COMMANDS).catch(e => {
+        console.error(`⚠️ Could not register slash commands on ${guild.name}. Re-invite the bot with the "applications.commands" scope. (${e.message})`);
+    });
+}
+
+// ==========================================
+// 6. READY / LIFECYCLE
+// ==========================================
+client.once(Events.ClientReady, () => {
+    loadEndpoints();
+    for (const key in endpoints) lastStatus[key] = 'none';
+    const urls = db.prepare(`SELECT id FROM monitored_urls`).all();
+    urls.forEach(row => lastStatusMonitoredUrls[row.id] = 'up');
+    loadPersistedState(); // overwrite the optimistic defaults above with whatever we knew before restart
+
+    for (const guild of client.guilds.cache.values()) registerSlashCommands(guild);
+
+    console.log(`✅ NOC Bot online! Logged in as ${client.user.tag}`);
+    globalMonitoring();
+    setInterval(globalMonitoring, 300000);
+
+    app.listen(3000, () => console.log('🌐 Webhook server active on port 3000'));
+});
+
+client.on(Events.GuildCreate, guild => registerSlashCommands(guild));
+
+// ==========================================
+// 7. WEBHOOKS
 // ==========================================
 app.post('/webhook/:id', (req, res) => {
-    if (req.get('X-API-KEY') !== process.env.WEBHOOK_KEY) return res.status(401).send({ message: 'Unauthorized' });
+    const projectChannel = db.prepare(`SELECT webhook_key FROM webhook_channels WHERE webhook_id = ?`).get(req.params.id);
+    const expectedKey = projectChannel?.webhook_key || process.env.WEBHOOK_KEY;
+    if (!expectedKey || req.get('X-API-KEY') !== expectedKey) return res.status(401).send({ message: 'Unauthorized' });
 
     const hasProblem = (req.body.status || 'error').toLowerCase() === 'error';
-    const hookEmbed = createEmbed(hasProblem ? COLORS.danger : COLORS.info)
-        .setTitle(`📡 Webhook [${req.params.id}]: ${req.body.title || 'External Alert'}`)
-        .setDescription(req.body.message || 'Event received.');
-
-    const projectChannel = db.prepare(`SELECT channel_id FROM webhook_channels WHERE webhook_id = ?`).get(req.params.id);
-    if (projectChannel) {
-        client.channels.fetch(projectChannel.channel_id).then(channel => channel?.send({ embeds: [hookEmbed] })).catch(() => {});
-    } else {
-        broadcastAlert(hookEmbed, hasProblem);
-    }
+    dispatchWebhookAlert(req.params.id, req.body.title, req.body.message, hasProblem);
     res.status(200).send({ message: 'OK' });
 });
 
 // ==========================================
-// 5. USER COMMANDS
+// 8. SLASH COMMAND INTERACTIONS
 // ==========================================
+client.on(Events.InteractionCreate, async (interaction) => {
+    if (interaction.isAutocomplete()) {
+        const focused = interaction.options.getFocused().toLowerCase();
+        const choices = interaction.commandName === 'status'
+            ? Object.entries(endpoints).map(([id, s]) => ({ name: s.name, value: id }))
+            : db.prepare(`SELECT id, name FROM monitored_urls`).all().map(r => ({ name: `${r.name} (${r.id})`, value: r.id }));
+        const filtered = choices.filter(c => c.value.toLowerCase().includes(focused) || c.name.toLowerCase().includes(focused)).slice(0, 25);
+        return interaction.respond(filtered).catch(() => {});
+    }
+
+    if (!interaction.isChatInputCommand()) return;
+    const { commandName, guildId, member, user } = interaction;
+    const isManager = () => hasPermission(member, guildId);
+
+    try {
+        if (commandName === 'help') {
+            const { embed, row } = buildHelpPanel();
+            const msg = await interaction.reply({ embeds: [embed], components: [row], fetchReply: true });
+            attachHelpCollector(msg, user.id);
+            return;
+        }
+
+        if (commandName === 'status') {
+            const sub = interaction.options.getSubcommand();
+            if (sub === 'all') {
+                const embed = buildStatusAllEmbed(interaction.guild);
+                const msg = await interaction.reply({ embeds: [embed], components: [refreshButtonRow()], fetchReply: true });
+                attachRefreshCollector(msg, interaction.guild);
+                return;
+            }
+            const id = interaction.options.getString('name');
+            const service = endpoints[id];
+            if (!service) return interaction.reply({ content: '⚠️ Unknown service.', ephemeral: true });
+            await interaction.deferReply();
+            const embed = await buildAuditEmbed(service);
+            return interaction.editReply({ embeds: [embed] });
+        }
+
+        if (commandName === 'config') {
+            if (!member?.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.reply({ content: '❌ Access denied.', ephemeral: true });
+            const channel = interaction.options.getChannel('channel');
+            const roles = [interaction.options.getRole('alert-role'), interaction.options.getRole('admin-role')].filter(Boolean).map(r => r.id);
+            const embed = doConfig(guildId, user.tag, channel.id, roles);
+            return interaction.reply({ embeds: [embed] });
+        }
+
+        if (commandName === 'channel') {
+            if (!isManager()) return interaction.reply({ content: '❌ Access denied.', ephemeral: true });
+            const webhookId = interaction.options.getString('webhook-id').toLowerCase();
+            const channel = interaction.options.getChannel('channel');
+            const { key, isNew } = doChannelMap(guildId, user.tag, webhookId, channel.id);
+            return interaction.reply({
+                content: `✅ Webhooks for \`${webhookId}\` now land in ${channel}.\n${isNew ? `🔑 API key (save it, only shown again with \`/channel-rotate\`): \`${key}\`` : `🔑 API key unchanged: \`${key}\``}`,
+                ephemeral: true
+            });
+        }
+
+        if (commandName === 'channel-rotate') {
+            if (!isManager()) return interaction.reply({ content: '❌ Access denied.', ephemeral: true });
+            const webhookId = interaction.options.getString('webhook-id').toLowerCase();
+            const key = doChannelRotate(guildId, user.tag, webhookId);
+            if (!key) return interaction.reply({ content: `⚠️ No channel mapped for \`${webhookId}\` yet. Use \`/channel\` first.`, ephemeral: true });
+            return interaction.reply({ content: `🔑 New API key for \`${webhookId}\`: \`${key}\` (old one stopped working).`, ephemeral: true });
+        }
+
+        if (commandName === 'monitor' || commandName === 'monitor-jenkins') {
+            if (!isManager()) return interaction.reply({ content: '❌ Access denied.', ephemeral: true });
+            const id = interaction.options.getString('id').toLowerCase();
+            const url = interaction.options.getString(commandName === 'monitor' ? 'url' : 'job-url');
+            const name = interaction.options.getString('name');
+            doMonitor(guildId, user.tag, id, url, name, commandName === 'monitor' ? 'url' : 'jenkins');
+            return interaction.reply({ embeds: [createEmbed(COLORS.success).setDescription(`✅ \`${id}\` added to the watchlist.`)] });
+        }
+
+        if (commandName === 'remove') {
+            if (!isManager()) return interaction.reply({ content: '❌ Access denied.', ephemeral: true });
+            const id = interaction.options.getString('id').toLowerCase();
+            const row = confirmRow();
+            const msg = await interaction.reply({ content: `⚠️ Remove \`${id}\` from the watchlist?`, components: [row], fetchReply: true });
+            attachRemoveConfirmCollector(msg, user.id, guildId, user.tag, id);
+            return;
+        }
+
+        if (commandName === 'ssl-ignore') {
+            if (!isManager()) return interaction.reply({ content: '❌ Access denied.', ephemeral: true });
+            const id = interaction.options.getString('id').toLowerCase();
+            doSslIgnore(guildId, user.tag, id);
+            return interaction.reply({ embeds: [createEmbed(COLORS.success).setDescription(`✅ SSL audit disabled for \`${id}\`.`)] });
+        }
+
+        if (commandName === 'incident') {
+            if (!isManager()) return interaction.reply({ content: '❌ Access denied.', ephemeral: true });
+            const id = interaction.options.getString('id').toLowerCase();
+            const msg = interaction.options.getString('message');
+            doIncident(guildId, user.tag, id, msg);
+            return interaction.reply({ embeds: [createEmbed(COLORS.info).setDescription(`⚠️ Maintenance enabled for \`${id}\`. Ping suspended.`)] });
+        }
+
+        if (commandName === 'resolve') {
+            if (!isManager()) return interaction.reply({ content: '❌ Access denied.', ephemeral: true });
+            const id = interaction.options.getString('id').toLowerCase();
+            doResolve(guildId, user.tag, id);
+            return interaction.reply({ embeds: [createEmbed(COLORS.success).setDescription(`✅ Maintenance finished for \`${id}\`.`)] });
+        }
+
+        if (commandName === 'report') {
+            const embed = doReport(interaction.options.getInteger('days'));
+            return interaction.reply({ embeds: [embed] });
+        }
+
+        if (commandName === 'webhook-test') {
+            if (!isManager()) return interaction.reply({ content: '❌ Access denied.', ephemeral: true });
+            const id = interaction.options.getString('id').toLowerCase();
+            dispatchWebhookAlert(id, 'Test Alert', 'This is a test payload from /webhook-test.', false);
+            return interaction.reply({ content: `✅ Test alert dispatched for \`${id}\`. Check the mapped channel.`, ephemeral: true });
+        }
+
+        if (commandName === 'audit') {
+            if (!isManager()) return interaction.reply({ content: '❌ Access denied.', ephemeral: true });
+            return interaction.reply({ embeds: [buildAuditLogEmbed(guildId)], ephemeral: true });
+        }
+    } catch (e) {
+        console.error(e);
+        const payload = { content: '❌ Something went wrong running that command.', ephemeral: true };
+        if (interaction.deferred || interaction.replied) interaction.editReply(payload).catch(() => {});
+        else interaction.reply(payload).catch(() => {});
+    }
+});
+
+function confirmRow() {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('confirm_remove').setLabel('Yes, remove').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('cancel_remove').setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+    );
+}
+
+function attachRemoveConfirmCollector(msg, authorId, guildId, userTag, id) {
+    const collector = msg.createMessageComponentCollector({ componentType: ComponentType.Button, time: 30000, max: 1 });
+    collector.on('collect', async i => {
+        if (i.user.id !== authorId) return i.reply({ content: '🚫 Not your call.', ephemeral: true });
+        if (i.customId === 'confirm_remove') {
+            const existed = doRemove(guildId, userTag, id);
+            await i.update({ content: existed ? `✅ \`${id}\` removed.` : `⚠️ No project with id \`${id}\`.`, components: [] });
+        } else {
+            await i.update({ content: '❌ Cancelled.', components: [] });
+        }
+    });
+    collector.on('end', collected => {
+        if (collected.size === 0) msg.edit({ content: '⌛ Confirmation timed out.', components: [] }).catch(() => {});
+    });
+}
+
+function attachRefreshCollector(msg, guild) {
+    const collector = msg.createMessageComponentCollector({ componentType: ComponentType.Button, time: 300000 });
+    collector.on('collect', async i => {
+        await i.deferUpdate();
+        await msg.edit({ embeds: [buildStatusAllEmbed(guild)] });
+    });
+    collector.on('end', () => msg.edit({ components: [] }).catch(() => {}));
+}
+
+function buildHelpPanel() {
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('help_public').setLabel('Queries').setEmoji('📊').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('help_config').setLabel('Configuration').setEmoji('⚙️').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('help_local').setLabel('Local Projects').setEmoji('💻').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('help_webhook').setLabel('Webhooks').setEmoji('📡').setStyle(ButtonStyle.Secondary)
+    );
+    const embed = createEmbed()
+        .setTitle('📚 NOC Bot Documentation')
+        .setThumbnail(client.user.displayAvatarURL())
+        .setDescription('Pick a category below to see detailed commands, examples and required permissions.\nEvery command also exists as a slash command (`/status`, `/monitor`, ...).')
+        .setFooter({ text: 'Monitoring & DevOps Center' });
+    return { embed, row };
+}
+
+function attachHelpCollector(msgHelp, authorId) {
+    const row = msgHelp.components[0];
+    const collector = msgHelp.createMessageComponentCollector({ componentType: ComponentType.Button, time: 120000 });
+
+    collector.on('collect', async i => {
+        if (i.user.id !== authorId) return i.reply({ content: '🚫 Use your own !help', ephemeral: true });
+
+        const newEmbed = createEmbed().setFooter({ text: 'NOC Bot • User Manual' });
+
+        if (i.customId === 'help_public') {
+            newEmbed.setTitle('📊 Queries and Dashboards')
+                .setDescription('Commands available to every user on the server.')
+                .addFields(
+                    { name: 'Interactive Incident Menu', value: 'Opens a dropdown menu to read the technical updates for a specific service that went down.\n```bash\n!status\n```' },
+                    { name: 'Global Dashboard', value: 'Generates a panel with every service organized by stack, showing who is Online 🟩, degraded 🟨 or Offline 🟥 right now. Has a refresh button.\n```bash\n!status all\n```' },
+                    { name: 'Uptime Report', value: 'Calculates the percentage of time every system stayed up, and its average response time.\n```bash\n!report [days]\n```' }
+                );
+        } else if (i.customId === 'help_config') {
+            newEmbed.setTitle('⚙️ Root Configuration')
+                .setDescription('Commands restricted to Discord **Administrators** only.')
+                .addFields(
+                    { name: 'Alert Engine Setup', value: 'Sets the bot\'s core rules: the channel to post to, who gets pinged on an outage, and who can manage the local project list.\n```bash\n# Usage:\n!config <#channel> <@alertRole> <@managerRole>\n\n# Real example:\n!config #devops @TechTeam @ProjectManagers\n```' }
+                );
+        } else if (i.customId === 'help_local') {
+            newEmbed.setTitle('💻 Local Projects & Management')
+                .setDescription('Commands restricted to **Administrators** and **Manager Roles**.')
+                .addFields(
+                    { name: 'Add a URL to the Watchlist', value: 'Pings the URL every 5 minutes and checks SSL (if HTTPS).\n```bash\n!monitor <id> <url> <Display Name>\n```' },
+                    { name: 'Add a Jenkins Job', value: 'Polls `<job-url>/lastBuild/api/json` every 5 minutes. Put basic auth in the URL if needed: `http://user:pass@jenkins/job/X`.\n```bash\n!monitor-jenkins <id> <job_url> <Display Name>\n```' },
+                    { name: 'Disable SSL Check', value: '```bash\n!ssl ignore <id>\n```' },
+                    { name: 'Open a Maintenance Incident', value: 'Pauses monitoring while you update your system.\n```bash\n!incident <id> <Message>\n```' },
+                    { name: 'Resolve / Remove', value: '`!remove` asks for confirmation before deleting.\n```bash\n!resolve <id>\n!remove <id>\n```' },
+                    { name: 'Audit Log', value: 'Last 10 admin actions on this server.\n```bash\n!audit\n```' }
+                );
+        } else if (i.customId === 'help_webhook') {
+            newEmbed.setTitle('📡 Webhooks & API')
+                .setDescription('The bot runs an Express server on port 3000 to receive payloads from any CI/CD pipeline (GitHub Actions, AWS, Jenkins).')
+                .addFields(
+                    { name: 'POST Structure (JSON)', value: 'Send the request to `http://<bot-ip>:3000/webhook/<project_id>` with the header `X-API-KEY: <key>`\n```json\n{\n  "title": "CloudWatch Alert",\n  "message": "CPU usage hit 90% on the Web Server.",\n  "status": "error" \n}\n```' },
+                    { name: 'Channel per Project', value: 'Maps a project to its own channel AND generates a dedicated API key for it (safer than sharing the global `.env` key across every project).\n```bash\n!channel <project_id> #channel\n!channel rotate <project_id>\n```' },
+                    { name: 'Test it', value: '```bash\n!webhook test <project_id>\n```' }
+                );
+        }
+
+        await i.update({ embeds: [newEmbed], components: [row] });
+    });
+
+    collector.on('end', () => msgHelp.edit({ components: [] }).catch(() => {}));
+}
+
+// ==========================================
+// 9. USER COMMANDS (! prefix)
+// ==========================================
+const KNOWN_COMMANDS = ['!help', '!config', '!channel', '!monitor', '!monitor-jenkins', '!remove', '!ssl', '!incident', '!resolve', '!report', '!status', '!webhook', '!audit'];
+
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
 
     const args = message.content.trim().split(/ +/);
     const command = args[0].toLowerCase();
 
+    if (command.startsWith('!') && !KNOWN_COMMANDS.includes(command)) {
+        return message.reply(`❓ Unknown command \`${command}\`. Try \`!help\`.`);
+    }
+
     // --- INTERACTIVE HELP PANEL ---
     if (command === '!help') {
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('help_public').setLabel('Queries').setEmoji('📊').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId('help_config').setLabel('Configuration').setEmoji('⚙️').setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId('help_local').setLabel('Local Projects').setEmoji('💻').setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId('help_webhook').setLabel('Webhooks').setEmoji('📡').setStyle(ButtonStyle.Secondary)
-        );
-
-        const embedBase = createEmbed()
-            .setTitle('📚 NOC Bot Documentation')
-            .setThumbnail(client.user.displayAvatarURL())
-            .setDescription('Pick a category below to see detailed commands, examples and required permissions.')
-            .setFooter({ text: 'Monitoring & DevOps Center' });
-
-        const msgHelp = await message.channel.send({ embeds: [embedBase], components: [row] });
-        const collector = msgHelp.createMessageComponentCollector({ componentType: ComponentType.Button, time: 120000 });
-
-        collector.on('collect', async i => {
-            if (i.user.id !== message.author.id) return i.reply({ content: '🚫 Use your own !help', ephemeral: true });
-
-            const newEmbed = createEmbed().setFooter({ text: 'NOC Bot • User Manual' });
-
-            if (i.customId === 'help_public') {
-                newEmbed.setTitle('📊 Queries and Dashboards')
-                    .setDescription('Commands available to every user on the server.')
-                    .addFields(
-                        { name: 'Interactive Incident Menu', value: 'Opens a dropdown menu to read the technical updates for a specific service that went down.\n```bash\n!status\n```' },
-                        { name: 'Global Dashboard', value: 'Generates a panel with every service organized by stack, showing who is Online 🟩 or Offline 🟥 right now.\n```bash\n!status all\n```' },
-                        { name: 'Weekly Uptime Report', value: 'Calculates the percentage of time every system stayed up over the last 7 days.\n```bash\n!report\n```' }
-                    );
-            } else if (i.customId === 'help_config') {
-                newEmbed.setTitle('⚙️ Root Configuration')
-                    .setDescription('Commands restricted to Discord **Administrators** only.')
-                    .addFields(
-                        { name: 'Alert Engine Setup', value: 'Sets the bot\'s core rules: the channel to post to, who gets pinged on an outage, and who can manage the local project list.\n```bash\n# Usage:\n!config <#channel> <@alertRole> <@managerRole>\n\n# Real example:\n!config #devops @TechTeam @ProjectManagers\n```' }
-                    );
-            } else if (i.customId === 'help_local') {
-                newEmbed.setTitle('💻 Local Projects & Management')
-                    .setDescription('Commands restricted to **Administrators** and **Manager Roles**.')
-                    .addFields(
-                        { name: 'Add Project to the Watchlist', value: 'The bot will ping the URL every 5 minutes and check SSL (if HTTPS).\n```bash\n# Usage:\n!monitor <id> <url> <Display Name>\n\n# Example:\n!monitor test_api https://api.site.com Node Backend API\n```' },
-                        { name: 'Disable SSL Check', value: 'Useful for internal APIs without HTTPS or with self-signed certificates.\n```bash\n# Usage:\n!ssl ignore <id>\n\n# Example:\n!ssl ignore test_api\n```' },
-                        { name: 'Open a Maintenance Incident', value: 'Pauses monitoring while you update your system, so it doesn\'t flood false error alerts.\n```bash\n# Usage:\n!incident <id> <Message>\n\n# Example:\n!incident test_api Database migration\n```' },
-                        { name: 'Resolve Incident / Remove Project', value: '```bash\n# Resume ping after maintenance:\n!resolve test_api\n\n# Remove a service permanently:\n!remove test_api\n```' }
-                    );
-            } else if (i.customId === 'help_webhook') {
-                newEmbed.setTitle('📡 Webhooks & API')
-                    .setDescription('The bot runs an Express server on port 3000 to receive payloads from any CI/CD pipeline (GitHub Actions, AWS, Vercel).')
-                    .addFields(
-                        { name: 'POST Structure (JSON)', value: 'Send the request to `http://<bot-ip>:3000/webhook/<project_id>` with the header `X-API-KEY: <WEBHOOK_KEY from .env>`\n```json\n{\n  "title": "CloudWatch Alert",\n  "message": "CPU usage hit 90% on the Web Server.",\n  "status": "error" \n}\n```\n*Tip: status can be "error" (Red Alert) or "info" (Blue Alert).*' },
-                        { name: 'Channel per Project', value: 'By default, every webhook falls back to the global broadcast on every server. To isolate a project into its own channel:\n```bash\n!channel <project_id> #channel\n```' }
-                    );
-            }
-
-            await i.update({ embeds: [newEmbed], components: [row] });
-        });
-
-        collector.on('end', () => msgHelp.edit({ components: [] }).catch(()=>null));
+        const { embed, row } = buildHelpPanel();
+        const msgHelp = await message.channel.send({ embeds: [embed], components: [row] });
+        attachHelpCollector(msgHelp, message.author.id);
         return;
     }
 
@@ -290,49 +850,75 @@ client.on('messageCreate', async (message) => {
     if (command === '!config') {
         if (!message.member?.permissions.has(PermissionsBitField.Flags.Administrator)) return message.reply("❌ Access denied.");
         const channel = message.mentions.channels.first();
-        const roles = Array.from(message.mentions.roles.values());
+        const roles = Array.from(message.mentions.roles.values()).map(r => r.id);
         if (!channel) return message.reply("⚠️ Incorrect usage. See `!help` > Configuration.");
 
-        db.prepare(`INSERT OR REPLACE INTO guild_configs (guild_id, channel_id, alert_role, admin_role) VALUES (?, ?, ?, ?)`).run(message.guild.id, channel.id, roles[0]?.id || null, roles[1]?.id || null);
-        return message.channel.send({ embeds: [createEmbed(COLORS.success).setDescription(`✅ Configuration saved and linked to ${channel}.`)] });
+        const embed = doConfig(message.guild.id, message.author.tag, channel.id, roles);
+        return message.channel.send({ embeds: [embed] });
     }
 
     if (command === '!channel') {
-        if (!hasPermission(message, message.guild.id)) return message.reply('❌ Access Denied.');
+        if (!hasPermission(message.member, message.guild.id)) return message.reply('❌ Access Denied.');
+
+        if (args[1] === 'rotate') {
+            const webhookId = args[2]?.toLowerCase();
+            if (!webhookId) return message.reply('⚠️ Usage: `!channel rotate <webhook_id>`');
+            const key = doChannelRotate(message.guild.id, message.author.tag, webhookId);
+            if (!key) return message.reply(`⚠️ No channel mapped for \`${webhookId}\` yet. Use \`!channel <id> #channel\` first.`);
+            return message.reply(`🔑 New API key for \`${webhookId}\`: \`${key}\` (old one stopped working).`);
+        }
+
         const webhookId = args[1]?.toLowerCase();
         const channel = message.mentions.channels.first();
         if (!webhookId || !channel) return message.reply('⚠️ Usage: `!channel <webhook_id> #channel`');
 
-        db.prepare(`INSERT OR REPLACE INTO webhook_channels (webhook_id, channel_id) VALUES (?, ?)`).run(webhookId, channel.id);
-        return message.reply(`✅ Webhooks for \`${webhookId}\` (\`http://<bot-ip>:3000/webhook/${webhookId}\`) now land in ${channel}.`);
+        const { key, isNew } = doChannelMap(message.guild.id, message.author.tag, webhookId, channel.id);
+        return message.reply(`✅ Webhooks for \`${webhookId}\` (\`http://<bot-ip>:3000/webhook/${webhookId}\`) now land in ${channel}.\n${isNew ? `🔑 API key (save it, only shown again with \`!channel rotate\`): \`${key}\`` : `🔑 API key unchanged: \`${key}\``}`);
     }
 
-    if (['!monitor', '!remove', '!ssl', '!incident', '!resolve'].includes(command)) {
-        if (!hasPermission(message, message.guild.id)) return message.reply('❌ Access Denied.');
+    if (command === '!webhook' && args[1] === 'test') {
+        if (!hasPermission(message.member, message.guild.id)) return message.reply('❌ Access Denied.');
+        const webhookId = args[2]?.toLowerCase();
+        if (!webhookId) return message.reply('⚠️ Usage: `!webhook test <webhook_id>`');
+        dispatchWebhookAlert(webhookId, 'Test Alert', 'This is a test payload from !webhook test.', false);
+        return message.reply(`✅ Test alert dispatched for \`${webhookId}\`. Check the mapped channel.`);
+    }
+
+    if (command === '!audit') {
+        if (!hasPermission(message.member, message.guild.id)) return message.reply('❌ Access Denied.');
+        return message.channel.send({ embeds: [buildAuditLogEmbed(message.guild.id)] });
+    }
+
+    if (command === '!remove') {
+        if (!hasPermission(message.member, message.guild.id)) return message.reply('❌ Access Denied.');
+        const serviceId = args[1]?.toLowerCase();
+        if (!serviceId) return message.reply('⚠️ Usage: `!remove <id>`');
+
+        const confirmMsg = await message.reply({ content: `⚠️ Remove \`${serviceId}\` from the watchlist?`, components: [confirmRow()] });
+        attachRemoveConfirmCollector(confirmMsg, message.author.id, message.guild.id, message.author.tag, serviceId);
+        return;
+    }
+
+    if (['!monitor', '!monitor-jenkins', '!ssl', '!incident', '!resolve'].includes(command)) {
+        if (!hasPermission(message.member, message.guild.id)) return message.reply('❌ Access Denied.');
         const serviceId = args[1]?.toLowerCase();
 
         try {
-            if (command === '!monitor') {
-                if(!serviceId || !args[2]) return message.reply("⚠️ Incorrect syntax. See examples in `!help`.");
-                db.prepare(`INSERT OR REPLACE INTO monitored_urls (id, name, url, ignore_ssl) VALUES (?, ?, ?, 0)`).run(serviceId, args.slice(3).join(' '), args[2]);
-                lastStatusMonitoredUrls[serviceId] = 'up';
-                return message.reply(`✅ Endpoint \`${serviceId}\` added to the watchlist.`);
-            }
-            if (command === '!remove') {
-                db.prepare(`DELETE FROM monitored_urls WHERE id = ?`).run(serviceId);
-                return message.reply(`✅ Service \`${serviceId}\` removed.`);
+            if (command === '!monitor' || command === '!monitor-jenkins') {
+                if (!serviceId || !args[2] || !args[3]) return message.reply("⚠️ Incorrect syntax. See examples in `!help`.");
+                doMonitor(message.guild.id, message.author.tag, serviceId, args[2], args.slice(3).join(' '), command === '!monitor' ? 'url' : 'jenkins');
+                return message.reply(`✅ \`${serviceId}\` added to the watchlist.`);
             }
             if (command === '!ssl' && args[1] === 'ignore') {
-                db.prepare(`UPDATE monitored_urls SET ignore_ssl = 1 WHERE id = ?`).run(args[2]);
+                doSslIgnore(message.guild.id, message.author.tag, args[2]);
                 return message.reply(`✅ SSL audit disabled for \`${args[2]}\`.`);
             }
             if (command === '!incident') {
-                db.prepare(`UPDATE monitored_urls SET manual_incident = ? WHERE id = ?`).run(args.slice(2).join(' ') || 'Maintenance', serviceId);
+                doIncident(message.guild.id, message.author.tag, serviceId, args.slice(2).join(' '));
                 return message.reply(`⚠️ Maintenance enabled. Ping suspended for \`${serviceId}\`.`);
             }
             if (command === '!resolve') {
-                db.prepare(`UPDATE monitored_urls SET manual_incident = NULL WHERE id = ?`).run(serviceId);
-                lastStatusMonitoredUrls[serviceId] = 'down';
+                doResolve(message.guild.id, message.author.tag, serviceId);
                 return message.reply(`✅ Maintenance finished for \`${serviceId}\`.`);
             }
         } catch (e) { return message.reply("❌ Syntax failure or SQLite error."); }
@@ -340,121 +926,37 @@ client.on('messageCreate', async (message) => {
 
     // --- DASHBOARDS & REPORTS ---
     if (command === '!report') {
-        const records = db.prepare(`SELECT service_id, status FROM uptime_history WHERE timestamp >= datetime('now', '-7 days')`).all();
-        if (records.length === 0) return message.channel.send({ embeds: [createEmbed().setDescription("📊 Collecting baseline data. Check back later.")] });
-
-        const stats = {};
-        records.forEach(r => {
-            if (!stats[r.service_id]) stats[r.service_id] = { up: 0, total: 0 };
-            stats[r.service_id].total++;
-            if (r.status === 'UP') stats[r.service_id].up++;
-        });
-
-        const embed = createEmbed().setTitle('📈 Weekly Uptime').setFooter({ text: '🟩 ≥98%  🟨 ≥90%  🟥 <90% (last 7 days)' });
-        let thirdPartyText = '', localText = '';
-
-        for (const [id, data] of Object.entries(stats)) {
-            const percentage = ((data.up / data.total) * 100).toFixed(2);
-            const filled = Math.round(percentage / 10);
-            const bar = (percentage < 90 ? '🟥' : (percentage < 98 ? '🟨' : '🟩')).repeat(filled) + '⬛'.repeat(10 - filled);
-
-            let name = endpoints[id] ? endpoints[id].name : (db.prepare(`SELECT name FROM monitored_urls WHERE id = ?`).get(id)?.name || id);
-            const line = `${bar} \`${percentage.padStart(6, ' ')}%\` **${name}**\n`;
-            if (endpoints[id]) thirdPartyText += line; else localText += line;
-        }
-
-        if (thirdPartyText) embed.addFields({ name: 'Third-Party', value: thirdPartyText });
-        if (localText) embed.addFields({ name: 'Local', value: localText });
-        return message.channel.send({ embeds: [embed] });
+        const days = args[1] ? parseInt(args[1], 10) : 7;
+        return message.channel.send({ embeds: [doReport(days)] });
     }
 
     if (command === '!status') {
         if (args[1] === 'all') {
-            const panelEmbed = createEmbed()
-                .setTitle('🌐 Global Operations Dashboard')
-                .setDescription('Instant status of the dev watchlist, grouped by stack.')
-                .setThumbnail(message.guild.iconURL() || client.user.displayAvatarURL())
-                .setFooter({ text: '🟩 Online   🟥 Offline   🟨 Maintenance' });
-
-            // Stack definitions
-            const stacks = {
-                '☁️ Cloud & Infra': ['cloudflare', 'vercel', 'docker', 'render', 'railway', 'aws'],
-                '🗄️ Databases & Backend': ['supabase', 'planetscale', 'redis'],
-                '🧠 AI': ['openai', 'anthropic', 'huggingface'],
-                '🛠️ DevTools & APIs': ['github', 'npm', 'pypi', 'discord', 'postman', 'sentry'],
-                '💳 Payments': ['stripe']
-            };
-
-            const formatLine = (key, service) => {
-                const isUp = lastStatus[key] === 'none';
-                const emoji = isUp ? '🟩' : '🟥';
-                let shortName = service.name.substring(0, 18);
-                if (service.name.length > 18) shortName += '..';
-                return `${emoji} \`${shortName.padEnd(20, ' ')}\`\n`;
-            };
-
-            const panels = {};
-            for (const [key, service] of Object.entries(endpoints)) {
-                let foundStack = '🧩 Other Services';
-                for (const [stackName, keyList] of Object.entries(stacks)) {
-                    if (keyList.includes(key)) { foundStack = stackName; break; }
-                }
-                if (!panels[foundStack]) panels[foundStack] = '';
-                panels[foundStack] += formatLine(key, service);
-            }
-
-            for (const [stack, text] of Object.entries(panels)) {
-                panelEmbed.addFields({ name: stack, value: text, inline: true });
-            }
-
-            let localText = '';
-            const projects = db.prepare(`SELECT id, name, manual_incident FROM monitored_urls`).all();
-            if (projects.length > 0) {
-                for (const p of projects) {
-                    if (p.manual_incident) {
-                        localText += `🟨 \`${p.name.substring(0,25).padEnd(25, ' ')}\` *(Maintenance)*\n`;
-                    } else {
-                        const isUp = lastStatusMonitoredUrls[p.id] === 'up';
-                        localText += `${isUp ? '🟩' : '🟥'} \`${p.name.substring(0,25).padEnd(25, ' ')}\`\n`;
-                    }
-                }
-            } else {
-                localText = '```\nNo local project on the watchlist.\n```';
-            }
-
-            panelEmbed.addFields(
-                { name: '​', value: '​', inline: false },
-                { name: '💻 Your Local Applications', value: localText, inline: false }
-            );
-
-            return message.channel.send({ embeds: [panelEmbed] });
+            const embed = buildStatusAllEmbed(message.guild);
+            const msg = await message.channel.send({ embeds: [embed], components: [refreshButtonRow()] });
+            attachRefreshCollector(msg, message.guild);
+            return;
         }
 
-        const row = new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('sel_status').setPlaceholder('Audit a service...').addOptions(Object.entries(endpoints).map(([id, service]) => ({ label: service.name, value: id })).slice(0, 25)));
-        const msgMenu = await message.channel.send({ embeds: [createEmbed().setDescription('📊 Pick a global target to investigate technical logs:')], components: [row] });
+        const msgMenu = await message.channel.send({ embeds: [createEmbed().setDescription('📊 Pick a global target to investigate technical logs:')], components: buildStatusSelectRows(0) });
 
-        const collector = msgMenu.createMessageComponentCollector({ componentType: ComponentType.StringSelect, time: 60000 });
+        const collector = msgMenu.createMessageComponentCollector({ time: 60000 });
         collector.on('collect', async i => {
             if (i.user.id !== message.author.id) return i.reply({ content: '🚫 Forbidden.', ephemeral: true });
-            const service = endpoints[i.values[0]];
-            await i.deferUpdate();
-            try {
-                // summary.json covers both open incidents AND in-progress scheduled maintenance —
-                // incidents.json alone misses maintenance windows, which can also flip the indicator.
-                const response = await axios.get(service.url.replace('status.json', 'summary.json'), axiosConfig);
-                const incident = response.data.incidents.find(inc => inc.status !== 'resolved');
-                const maintenance = response.data.scheduled_maintenances.find(m => m.status === 'in_progress');
-                const event = incident || maintenance;
-                const embed = createEmbed(event ? COLORS.danger : COLORS.success).setTitle(`🔍 Audit: ${service.name}`);
-                if (!event) embed.setDescription('🟢 No anomalies reported.');
-                else {
-                    const icon = incident ? '⚠️' : '🔧';
-                    embed.setDescription(`${icon} **${event.name}**\n${event.incident_updates.slice(0, 2).map(up => `> **[${up.status.toUpperCase()}]** - ${up.body}`).join('\n\n')}`);
-                }
-                await msgMenu.edit({ embeds: [embed], components: [row] });
-            } catch(e) { }
+
+            if (i.isButton() && i.customId.startsWith('status_page:')) {
+                const page = parseInt(i.customId.split(':')[1], 10);
+                return i.update({ components: buildStatusSelectRows(page) });
+            }
+            if (i.isStringSelectMenu()) {
+                const page = parseInt(i.customId.split(':')[1] || '0', 10);
+                const service = endpoints[i.values[0]];
+                await i.deferUpdate();
+                const embed = await buildAuditEmbed(service);
+                await msgMenu.edit({ embeds: [embed], components: buildStatusSelectRows(page) });
+            }
         });
-        collector.on('end', () => msgMenu.edit({ components: [] }).catch(()=>null));
+        collector.on('end', () => msgMenu.edit({ components: [] }).catch(() => {}));
     }
 });
 
