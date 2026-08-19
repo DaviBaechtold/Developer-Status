@@ -1,4 +1,9 @@
 {
+  "oracle": {
+    "name": "Oracle Cloud",
+    "url": "https://ocistatus.oraclecloud.com/api/v2/status.json",
+    "type": "atlassian"
+  },
   "cursor": {
     "name": "Cursor",
     "url": "https://status.cursor.com/api/v2/status.json",

@@ -521,7 +521,7 @@ function buildAuditLogEmbed(guildId) {
 }
 
 const STACKS = {
-    '☁️ Cloud & Infra': ['cloudflare', 'vercel', 'docker', 'render', 'railway', 'aws'],
+    '☁️ Cloud & Infra': ['cloudflare', 'vercel', 'docker', 'render', 'railway', 'aws', 'oracle'],
     '🗄️ Databases & Backend': ['supabase', 'planetscale', 'redis'],
     '🧠 AI': ['openai', 'anthropic', 'huggingface', 'cursor', 'windsurf', 'copilot', 'deepseek', 'kimi'],
     '🛠️ DevTools & APIs': ['github', 'npm', 'pypi', 'discord', 'postman', 'sentry'],
