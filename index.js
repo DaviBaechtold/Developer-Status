@@ -209,22 +209,37 @@ function dispatchWebhookAlert(webhookId, title, msg, hasProblem) {
 // ==========================================
 const insertHistory = db.prepare(`INSERT INTO uptime_history (service_id, status, latency_ms, guild_id) VALUES (?, ?, ?, ?)`);
 
+// Some services (e.g. GitHub Copilot) don't have their own status page — they're one component
+// inside a bigger one (github's). `atlassian-component` reads components.json and tracks just
+// that component's status instead of the whole page's indicator.
+const COMPONENT_STATUS_MAP = { operational: 'none', degraded_performance: 'minor', partial_outage: 'major', major_outage: 'critical', under_maintenance: 'minor' };
+
+async function fetchServiceStatus(service) {
+    if (service.type === 'atlassian-component') {
+        const response = await axios.get(service.url.replace('status.json', 'components.json'), axiosConfig);
+        const component = response.data.components.find(c => c.id === service.componentId);
+        if (!component) throw new Error('component not found');
+        return { indicator: COMPONENT_STATUS_MAP[component.status] || 'minor', description: `${component.name}: ${component.status.replace(/_/g, ' ')}` };
+    }
+    const response = await axios.get(service.url, axiosConfig);
+    return { indicator: response.data.status.indicator, description: response.data.status.description };
+}
+
 async function monitorThirdParty() {
     let hasChanged = false, hasProblem = false;
     const alertEmbed = createEmbed().setFooter({ text: 'Automated NOC Center' });
 
     for (const [key, service] of Object.entries(endpoints)) {
         try {
-            if (service.type !== 'atlassian') continue;
+            if (service.type !== 'atlassian' && service.type !== 'atlassian-component') continue;
             const start = Date.now();
-            const response = await axios.get(service.url, axiosConfig);
+            const { indicator: currentStatus, description } = await fetchServiceStatus(service);
             const latency = Date.now() - start;
-            const currentStatus = response.data.status.indicator;
 
             if (!lastStatus[key]) lastStatus[key] = 'none';
             if (currentStatus !== 'none' && currentStatus !== lastStatus[key]) {
                 hasChanged = true; hasProblem = true;
-                alertEmbed.addFields({ name: `🔴 ${service.name}`, value: response.data.status.description });
+                alertEmbed.addFields({ name: `🔴 ${service.name}`, value: description });
             } else if (currentStatus === 'none' && lastStatus[key] !== 'none') {
                 hasChanged = true;
                 alertEmbed.addFields({ name: `✅ ${service.name}`, value: 'Operations back to normal.' });
@@ -436,6 +451,18 @@ async function buildAuditEmbed(service) {
         // summary.json covers both open incidents AND in-progress scheduled maintenance —
         // incidents.json alone misses maintenance windows, which can also flip the indicator.
         const response = await axios.get(service.url.replace('status.json', 'summary.json'), axiosConfig);
+
+        if (service.type === 'atlassian-component') {
+            const component = response.data.components.find(c => c.id === service.componentId);
+            const incident = response.data.incidents.find(inc => inc.status !== 'resolved' && inc.components?.some(c => c.id === service.componentId));
+            const degraded = component && component.status !== 'operational';
+            embed.setColor((incident || degraded) ? COLORS.danger : COLORS.success);
+            if (incident) embed.setDescription(`⚠️ **${incident.name}**\n${incident.incident_updates.slice(0, 2).map(up => `> **[${up.status.toUpperCase()}]** - ${up.body}`).join('\n\n')}`);
+            else if (degraded) embed.setDescription(`🟡 **${component.name}** is currently **${component.status.replace(/_/g, ' ')}**.`);
+            else embed.setDescription('🟢 No anomalies reported.');
+            return embed;
+        }
+
         const incident = response.data.incidents.find(inc => inc.status !== 'resolved');
         const maintenance = response.data.scheduled_maintenances.find(m => m.status === 'in_progress');
         const event = incident || maintenance;
@@ -465,7 +492,7 @@ function buildAuditLogEmbed(guildId) {
 const STACKS = {
     '☁️ Cloud & Infra': ['cloudflare', 'vercel', 'docker', 'render', 'railway', 'aws'],
     '🗄️ Databases & Backend': ['supabase', 'planetscale', 'redis'],
-    '🧠 AI': ['openai', 'anthropic', 'huggingface', 'cursor', 'windsurf'],
+    '🧠 AI': ['openai', 'anthropic', 'huggingface', 'cursor', 'windsurf', 'copilot', 'deepseek', 'kimi'],
     '🛠️ DevTools & APIs': ['github', 'npm', 'pypi', 'discord', 'postman', 'sentry'],
     '💳 Payments': ['stripe']
 };
@@ -837,7 +864,8 @@ function buildHelpPanel() {
         new ButtonBuilder().setCustomId('help_public').setLabel('Queries').setEmoji('📊').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('help_config').setLabel('Configuration').setEmoji('⚙️').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('help_local').setLabel('Local Projects').setEmoji('💻').setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId('help_webhook').setLabel('Webhooks').setEmoji('📡').setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId('help_webhook').setLabel('Webhooks').setEmoji('📡').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('help_tutorial').setLabel('CI/CD Tutorial').setEmoji('🛠️').setStyle(ButtonStyle.Secondary)
     );
     const embed = createEmbed()
         .setTitle('📚 NOC Bot Documentation')
@@ -888,6 +916,48 @@ function attachHelpCollector(msgHelp, authorId) {
                     { name: 'POST Structure (JSON)', value: 'Send the request to `http://<bot-ip>:3000/webhook/<project_id>` with the header `X-API-KEY: <key>`\n```json\n{\n  "title": "CloudWatch Alert",\n  "message": "CPU usage hit 90% on the Web Server.",\n  "status": "error" \n}\n```' },
                     { name: 'Channel per Project', value: 'Maps a project to its own channel AND issues it a dedicated API key. Once a server claims a `project_id`, only that server can remap or rotate it — other servers can\'t hijack it by reusing the same id.\n```bash\n!channel <project_id> #channel\n!channel rotate <project_id>\n```or `/channel`, `/channel-rotate`' },
                     { name: 'Test it', value: '```bash\n!webhook test <project_id>\n```or `/webhook-test`' }
+                );
+        } else if (i.customId === 'help_tutorial') {
+            newEmbed.setTitle('🛠️ CI/CD Tutorial — Step by Step')
+                .setDescription('**0.** Run `!channel my-project #channel` here first — it creates the project and hands you an API key. Use that key below instead of `<KEY>`.')
+                .addFields(
+                    {
+                        name: '1️⃣ GitHub Actions', value:
+                            'Repo → **Settings → Secrets and variables → Actions → New repository secret** → name it `DISCORD_KEY`, paste the key from step 0.\n' +
+                            'Then add this step to your workflow `.yml`:\n' +
+                            '```yaml\n' +
+                            '- name: Notify Discord\n' +
+                            '  if: always()\n' +
+                            '  run: |\n' +
+                            '    curl -X POST http://<bot-ip>:3000/webhook/my-project \\\n' +
+                            '      -H "X-API-KEY: ${{ secrets.DISCORD_KEY }}" \\\n' +
+                            '      -d \'{"title":"${{ github.workflow }}","message":"Run finished","status":"${{ job.status == \'success\' && \'info\' || \'error\' }}"}\'\n' +
+                            '```'
+                    },
+                    {
+                        name: '2️⃣ Jenkins (Jenkinsfile)', value:
+                            '**Manage Jenkins → Credentials → Add → Secret text** → id `discord-key`, paste the key from step 0.\n' +
+                            'Then add to your `Jenkinsfile`:\n' +
+                            '```groovy\n' +
+                            'environment { DISCORD_KEY = credentials(\'discord-key\') }\n' +
+                            'post {\n' +
+                            '  always {\n' +
+                            '    script {\n' +
+                            '      def ok = currentBuild.currentResult == \'SUCCESS\'\n' +
+                            '      sh """\n' +
+                            '        curl -X POST http://<bot-ip>:3000/webhook/my-project \\\\\n' +
+                            '          -H \'X-API-KEY: ${DISCORD_KEY}\' \\\\\n' +
+                            '          -d \'{"title":"${JOB_NAME} #${BUILD_NUMBER}","message":"${currentBuild.currentResult}","status":"${ok ? \'info\' : \'error\'}"}\'\n' +
+                            '      """\n' +
+                            '    }\n' +
+                            '  }\n' +
+                            '}\n' +
+                            '```\n' +
+                            'Jenkins behind a VPN only needs *outbound* access to the bot for this — it never needs to reach Jenkins itself, unlike `!monitor-jenkins` polling.'
+                    },
+                    {
+                        name: '3️⃣ Verify', value: 'Push a commit / run the pipeline, or just run `!webhook test my-project` to fire a sample alert without waiting for a real build.'
+                    }
                 );
         }
 

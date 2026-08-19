@@ -9,6 +9,22 @@
     "url": "https://status.windsurf.com/api/v2/status.json",
     "type": "atlassian"
   },
+  "copilot": {
+    "name": "GitHub Copilot",
+    "url": "https://www.githubstatus.com/api/v2/status.json",
+    "type": "atlassian-component",
+    "componentId": "pjmpxvq2cmr2"
+  },
+  "deepseek": {
+    "name": "DeepSeek",
+    "url": "https://deepseek.statuspage.io/api/v2/status.json",
+    "type": "atlassian"
+  },
+  "kimi": {
+    "name": "Kimi (Moonshot AI)",
+    "url": "https://status.moonshot.cn/api/v2/status.json",
+    "type": "atlassian"
+  },
   "github": {
     "name": "GitHub",
     "url": "https://www.githubstatus.com/api/v2/status.json",
