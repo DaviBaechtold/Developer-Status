@@ -4,9 +4,14 @@ const fs = require('fs');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const express = require('express');
-const cors = require('cors');
 const sslChecker = require('ssl-checker');
 require('dotenv').config();
+
+// Last line of defense: a bad embed (oversized field, Discord API hiccup, etc.) anywhere in a
+// setInterval/collector callback is an UNHANDLED rejection with no framework to catch it — that
+// crashes the whole process with no auto-restart. Log and keep running instead of going dark.
+process.on('unhandledRejection', (err) => console.error('⚠️ Unhandled rejection:', err));
+process.on('uncaughtException', (err) => console.error('⚠️ Uncaught exception:', err));
 
 // ==========================================
 // 1. SERVICE INITIALIZATION
@@ -17,7 +22,6 @@ const client = new Client({
 
 const app = express();
 app.use(express.json());
-app.use(cors());
 
 const db = new Database('./bot_data.sqlite');
 
@@ -111,6 +115,22 @@ let lastStatus = {};
 let lastStatusMonitoredUrls = {}; // keyed "guildId:localId" — local watchlists are per-guild
 
 function localKey(guildId, id) { return `${guildId}:${id}`; }
+
+// Discord hard-caps embed field values at 1024 chars and titles at 256 — anything stored here
+// eventually gets rendered into one. Clamp at the door instead of finding out 5 minutes later
+// when the monitoring loop tries to build the alert and throws.
+function clamp(str, max) { return (str ?? '').toString().slice(0, max); }
+
+// Strips basic-auth creds out of a URL before it's ever written to the audit log — !monitor-jenkins
+// documents putting them in the URL itself, and the audit log is readable by any manager, not just
+// whoever added the job.
+function redactUrl(url) {
+    try {
+        const u = new URL(url);
+        if (u.username || u.password) { u.username = '***'; u.password = ''; }
+        return u.toString();
+    } catch (e) { return url; }
+}
 
 function loadEndpoints() {
     try {
@@ -335,13 +355,22 @@ async function monitorGuildWatchlist(guildId, sites) {
     if (hasChanged) broadcastAlert(alertEmbed, hasProblem, guildId);
 }
 
+// setInterval fires every 5 min regardless of whether the previous run finished — with enough
+// monitored URLs across enough guilds, cycles could start overlapping and pile up. Skip instead.
+let monitoringInProgress = false;
 async function globalMonitoring() {
-    await monitorThirdParty();
+    if (monitoringInProgress) return;
+    monitoringInProgress = true;
+    try {
+        await monitorThirdParty();
 
-    const guildIds = db.prepare(`SELECT DISTINCT guild_id FROM monitored_urls`).all().map(r => r.guild_id);
-    for (const guildId of guildIds) {
-        const sites = db.prepare(`SELECT id, name, url, manual_incident, ignore_ssl, kind FROM monitored_urls WHERE guild_id = ?`).all(guildId);
-        await monitorGuildWatchlist(guildId, sites);
+        const guildIds = db.prepare(`SELECT DISTINCT guild_id FROM monitored_urls`).all().map(r => r.guild_id);
+        for (const guildId of guildIds) {
+            const sites = db.prepare(`SELECT id, name, url, manual_incident, ignore_ssl, kind FROM monitored_urls WHERE guild_id = ?`).all(guildId);
+            await monitorGuildWatchlist(guildId, sites);
+        }
+    } finally {
+        monitoringInProgress = false;
     }
 }
 
@@ -380,9 +409,10 @@ function doChannelRotate(guildId, userTag, webhookId) {
 }
 
 function doMonitor(guildId, userTag, id, url, name, kind = 'url') {
+    id = clamp(id, 80); name = clamp(name, 80); url = clamp(url, 500);
     db.prepare(`INSERT OR REPLACE INTO monitored_urls (guild_id, id, name, url, ignore_ssl, kind) VALUES (?, ?, ?, ?, 0, ?)`).run(guildId, id, name, url, kind);
     setLocalStatus(guildId, id, 'up');
-    logAudit(guildId, userTag, 'monitor', `${id} (${kind}) -> ${url}`);
+    logAudit(guildId, userTag, 'monitor', `${id} (${kind}) -> ${redactUrl(url)}`);
 }
 
 function doRemove(guildId, userTag, id) {
@@ -400,8 +430,9 @@ function doSslIgnore(guildId, userTag, id) {
 }
 
 function doIncident(guildId, userTag, id, msg) {
-    db.prepare(`UPDATE monitored_urls SET manual_incident = ? WHERE guild_id = ? AND id = ?`).run(msg || 'Maintenance', guildId, id);
-    logAudit(guildId, userTag, 'incident', `${id}: ${msg || 'Maintenance'}`);
+    msg = clamp(msg || 'Maintenance', 900); // leaves room for the "🔧 Maintenance: <name>" field name prefix
+    db.prepare(`UPDATE monitored_urls SET manual_incident = ? WHERE guild_id = ? AND id = ?`).run(msg, guildId, id);
+    logAudit(guildId, userTag, 'incident', `${id}: ${msg}`);
 }
 
 function doResolve(guildId, userTag, id) {
@@ -683,14 +714,41 @@ client.on(Events.GuildCreate, guild => registerSlashCommands(guild));
 // ==========================================
 // 7. WEBHOOKS
 // ==========================================
-app.post('/webhook/:id', (req, res) => {
-    const projectChannel = db.prepare(`SELECT webhook_key FROM webhook_channels WHERE webhook_id = ?`).get(req.params.id);
-    const expectedKey = projectChannel?.webhook_key || process.env.WEBHOOK_KEY;
-    if (!expectedKey || req.get('X-API-KEY') !== expectedKey) return res.status(401).send({ message: 'Unauthorized' });
+function timingSafeEqualStr(a, b) {
+    const bufA = Buffer.from(a || '');
+    const bufB = Buffer.from(b || '');
+    if (bufA.length !== bufB.length) return false; // crypto.timingSafeEqual requires equal-length buffers
+    return crypto.timingSafeEqual(bufA, bufB);
+}
 
-    const hasProblem = (req.body.status || 'error').toLowerCase() === 'error';
-    dispatchWebhookAlert(req.params.id, req.body.title, req.body.message, hasProblem);
-    res.status(200).send({ message: 'OK' });
+// ponytail: in-memory sliding window, per-process — resets on restart and won't scale across
+// multiple bot instances behind a load balancer. Fine for a single-process internal tool; swap
+// for a real store (Redis) if this ever runs more than one instance.
+const webhookAttempts = new Map();
+function isRateLimited(ip) {
+    const now = Date.now();
+    const windowMs = 60000, maxAttempts = 30;
+    const recent = (webhookAttempts.get(ip) || []).filter(t => now - t < windowMs);
+    recent.push(now);
+    webhookAttempts.set(ip, recent);
+    return recent.length > maxAttempts;
+}
+
+app.post('/webhook/:id', (req, res) => {
+    try {
+        if (isRateLimited(req.ip)) return res.status(429).send({ message: 'Too many requests' });
+
+        const projectChannel = db.prepare(`SELECT webhook_key FROM webhook_channels WHERE webhook_id = ?`).get(req.params.id);
+        const expectedKey = projectChannel?.webhook_key || process.env.WEBHOOK_KEY;
+        if (!expectedKey || !timingSafeEqualStr(req.get('X-API-KEY'), expectedKey)) return res.status(401).send({ message: 'Unauthorized' });
+
+        const hasProblem = (req.body.status || 'error').toLowerCase() === 'error';
+        dispatchWebhookAlert(req.params.id, clamp(req.body.title, 200), clamp(req.body.message, 3500), hasProblem);
+        res.status(200).send({ message: 'OK' });
+    } catch (e) {
+        console.error('Webhook error:', e);
+        res.status(400).send({ message: 'Bad request' });
+    }
 });
 
 // ==========================================

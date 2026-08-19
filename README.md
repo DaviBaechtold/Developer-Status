@@ -83,3 +83,12 @@ Editable in `endpoints.json` (Atlassian Statuspage `/api/v2/status.json` format)
 ## Stack
 
 Node.js, discord.js v14 (message commands + slash commands), better-sqlite3, Express (webhook server).
+
+## Security
+
+- **Process resilience**: `process.on('unhandledRejection'/'uncaughtException')` log and keep running instead of crashing — still run it under a process manager (`pm2`, a `systemd` unit, or Docker `restart: always`) for real auto-recovery if the process does die (OOM, host reboot, etc). Nothing here does that for you.
+- **Webhook auth**: constant-time key comparison, per-project keys (`!channel`) isolate blast radius, and a 30-req/min per-IP rate limit blunts brute-force/DoS on `/webhook/:id`.
+- **Input length limits**: incident messages, project ids/names/URLs, and webhook payload fields are clamped to what Discord's embed limits allow, so oversized input can't crash the monitoring loop anymore.
+- **Credential handling**: don't paste real secrets into Discord messages — `!monitor-jenkins` accepting `user:pass@host` in the URL is a convenience, not a vault; the audit log redacts it, but the raw URL still sits in `bot_data.sqlite` in plaintext. Prefer the CI/CD webhook flow (`!help` → CI/CD Tutorial) over polling a job that needs credentials, when possible.
+- **Bot permissions**: the OAuth invite URL in Setup suggests `Administrator` for simplicity. That's more than the bot needs (it only sends/edits messages and mentions roles) — for a bot running across multiple companies' servers, prefer the minimal set: View Channels, Send Messages, Embed Links, Mention Everyone, Add Reactions.
+- **SSRF-aware watchlist**: `!monitor`/`!monitor-jenkins` let anyone with the manager role point the bot at arbitrary URLs, including internal/private network addresses — the bot will fetch them every 5 minutes. Only grant the manager role to people you'd trust with server-side request access.
