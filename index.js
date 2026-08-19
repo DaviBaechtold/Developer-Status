@@ -734,6 +734,12 @@ function isRateLimited(ip) {
     return recent.length > maxAttempts;
 }
 
+// Unauthenticated on purpose — nothing sensitive in the response, and an external uptime monitor
+// (UptimeRobot, etc.) needs to hit it without a key. Point it here to get alerted if the VM dies.
+app.get('/health', (req, res) => {
+    res.status(client.isReady() ? 200 : 503).send({ discord: client.isReady() ? 'connected' : 'connecting' });
+});
+
 app.post('/webhook/:id', (req, res) => {
     try {
         if (isRateLimited(req.ip)) return res.status(429).send({ message: 'Too many requests' });
