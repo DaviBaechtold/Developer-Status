@@ -532,15 +532,15 @@ function buildStatusAllEmbed(guild) {
     const panelEmbed = createEmbed()
         .setTitle('🌐 Global Operations Dashboard')
         .setDescription('Instant status of the dev watchlist, grouped by stack.')
-        .setThumbnail(guild?.iconURL() || client.user.displayAvatarURL())
+        .setThumbnail(client.user.displayAvatarURL())
         .setFooter({ text: '🟩 Operational   🟨 Minor issue   🟥 Major/Critical outage' });
 
+    // Plain text, no code-block/padding — a fixed-width monospace box fights Discord's actual
+    // field width across devices and ends up clipped. Emoji + name wraps naturally instead.
     const formatLine = (key, service) => {
         const status = lastStatus[key];
         const emoji = status === 'none' ? '🟩' : status === 'minor' ? '🟨' : '🟥';
-        let shortName = service.name.substring(0, 18);
-        if (service.name.length > 18) shortName += '..';
-        return `${emoji} \`${shortName.padEnd(20, ' ')}\`\n`;
+        return `${emoji} ${service.name}\n`;
     };
 
     const panels = {};
@@ -561,15 +561,16 @@ function buildStatusAllEmbed(guild) {
     const projects = guild ? db.prepare(`SELECT id, name, manual_incident FROM monitored_urls WHERE guild_id = ?`).all(guild.id) : [];
     if (projects.length > 0) {
         for (const p of projects) {
+            const name = p.name.length > 40 ? p.name.slice(0, 39) + '…' : p.name;
             if (p.manual_incident) {
-                localText += `🟨 \`${p.name.substring(0,25).padEnd(25, ' ')}\` *(Maintenance)*\n`;
+                localText += `🟨 ${name} *(Maintenance)*\n`;
             } else {
                 const isUp = lastStatusMonitoredUrls[localKey(guild.id, p.id)] === 'up';
-                localText += `${isUp ? '🟩' : '🟥'} \`${p.name.substring(0,25).padEnd(25, ' ')}\`\n`;
+                localText += `${isUp ? '🟩' : '🟥'} ${name}\n`;
             }
         }
     } else {
-        localText = '```\nNo local project on the watchlist.\n```';
+        localText = 'No local project on the watchlist.';
     }
 
     panelEmbed.addFields(
