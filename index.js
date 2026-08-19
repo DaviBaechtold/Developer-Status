@@ -535,12 +535,10 @@ function buildStatusAllEmbed(guild) {
         .setThumbnail(client.user.displayAvatarURL())
         .setFooter({ text: '🟩 Operational   🟨 Minor issue   🟥 Major/Critical outage' });
 
-    // Plain text, no code-block/padding — a fixed-width monospace box fights Discord's actual
-    // field width across devices and ends up clipped. Emoji + name wraps naturally instead.
     const formatLine = (key, service) => {
         const status = lastStatus[key];
         const emoji = status === 'none' ? '🟩' : status === 'minor' ? '🟨' : '🟥';
-        return `${emoji} ${service.name}\n`;
+        return `${emoji} \`${service.name.padEnd(16, ' ')}\`\n`;
     };
 
     const panels = {};
@@ -561,16 +559,16 @@ function buildStatusAllEmbed(guild) {
     const projects = guild ? db.prepare(`SELECT id, name, manual_incident FROM monitored_urls WHERE guild_id = ?`).all(guild.id) : [];
     if (projects.length > 0) {
         for (const p of projects) {
-            const name = p.name.length > 40 ? p.name.slice(0, 39) + '…' : p.name;
+            const name = p.name.length > 25 ? p.name.slice(0, 24) + '…' : p.name;
             if (p.manual_incident) {
-                localText += `🟨 ${name} *(Maintenance)*\n`;
+                localText += `🟨 \`${name.padEnd(25, ' ')}\` *(Maintenance)*\n`;
             } else {
                 const isUp = lastStatusMonitoredUrls[localKey(guild.id, p.id)] === 'up';
-                localText += `${isUp ? '🟩' : '🟥'} ${name}\n`;
+                localText += `${isUp ? '🟩' : '🟥'} \`${name.padEnd(25, ' ')}\`\n`;
             }
         }
     } else {
-        localText = 'No local project on the watchlist.';
+        localText = '```\nNo local project on the watchlist.\n```';
     }
 
     panelEmbed.addFields(
