@@ -709,7 +709,27 @@ client.once(Events.ClientReady, () => {
     app.listen(3000, () => console.log('🌐 Webhook server active on port 3000'));
 });
 
-client.on(Events.GuildCreate, guild => registerSlashCommands(guild));
+function buildWelcomeEmbed() {
+    return createEmbed(COLORS.info)
+        .setTitle('👋 Thanks for adding NOC Bot!')
+        .setThumbnail(client.user.displayAvatarURL())
+        .setDescription('I track third-party service status, ping your own URLs/Jenkins jobs, and receive CI/CD webhooks — everything routed to whichever channels you pick. This server\'s setup is completely separate from any other server I\'m in.')
+        .addFields(
+            { name: '1️⃣ Set the alert channel', value: '`!config #channel` — optionally mention a role after the channel to get pinged on outages, and a second role to allow managing the watchlist. This is where third-party outage alerts land.' },
+            { name: '2️⃣ Route each project\'s webhooks', value: '`!channel <project_id> #channel` — run once per project. Gives that project its own channel and its own API key for GitHub Actions/Jenkins.' },
+            { name: '3️⃣ Everything else', value: 'Run `!help` (or `/help`) for the full command list, including a step-by-step CI/CD tutorial with copy-pasteable YAML/Groovy.' }
+        );
+}
+
+client.on(Events.GuildCreate, async guild => {
+    registerSlashCommands(guild);
+    try {
+        const me = guild.members.me ?? await guild.members.fetchMe();
+        const channel = (guild.systemChannel?.permissionsFor(me)?.has(PermissionsBitField.Flags.SendMessages) ? guild.systemChannel : null)
+            ?? guild.channels.cache.find(c => c.isTextBased() && c.permissionsFor(me)?.has(PermissionsBitField.Flags.SendMessages));
+        await channel?.send({ embeds: [buildWelcomeEmbed()] });
+    } catch (e) { console.error('Welcome message failed:', e.message); }
+});
 
 // ==========================================
 // 7. WEBHOOKS
