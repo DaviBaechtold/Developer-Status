@@ -4,7 +4,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const express = require('express');
-const sslChecker = require('ssl-checker');
+const { sslChecker } = require('ssl-checker');
 require('dotenv').config();
 
 // Last line of defense: a bad embed (oversized field, Discord API hiccup, etc.) anywhere in a
