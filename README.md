@@ -80,6 +80,10 @@ Editable in `endpoints.json` (Atlassian Statuspage `/api/v2/status.json` format)
 
 `bot_data.sqlite` (gitignored) holds guild config, the watchlist, webhook keys, uptime/latency history, current status (survives a restart — no false "recovered" alert after a redeploy), and the admin action log.
 
+## Running it 24/7
+
+See [DEPLOY.md](DEPLOY.md) for hosting this somewhere other than your own machine — Oracle Cloud's Always Free tier, since it's the only free option that actually fits (long-running process, persistent SQLite file, public port for webhooks — Railway and Fly.io dropped their free tiers, Render's free plan sleeps and wipes the disk).
+
 ## Stack
 
 Node.js, discord.js v14 (message commands + slash commands), better-sqlite3, Express (webhook server).
