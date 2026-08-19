@@ -1,4 +1,14 @@
 {
+  "cursor": {
+    "name": "Cursor",
+    "url": "https://status.cursor.com/api/v2/status.json",
+    "type": "atlassian"
+  },
+  "windsurf": {
+    "name": "Windsurf (Codeium)",
+    "url": "https://status.windsurf.com/api/v2/status.json",
+    "type": "atlassian"
+  },
   "github": {
     "name": "GitHub",
     "url": "https://www.githubstatus.com/api/v2/status.json",

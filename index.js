@@ -465,7 +465,7 @@ function buildAuditLogEmbed(guildId) {
 const STACKS = {
     '☁️ Cloud & Infra': ['cloudflare', 'vercel', 'docker', 'render', 'railway', 'aws'],
     '🗄️ Databases & Backend': ['supabase', 'planetscale', 'redis'],
-    '🧠 AI': ['openai', 'anthropic', 'huggingface'],
+    '🧠 AI': ['openai', 'anthropic', 'huggingface', 'cursor', 'windsurf'],
     '🛠️ DevTools & APIs': ['github', 'npm', 'pypi', 'discord', 'postman', 'sentry'],
     '💳 Payments': ['stripe']
 };
@@ -860,34 +860,34 @@ function attachHelpCollector(msgHelp, authorId) {
             newEmbed.setTitle('📊 Queries and Dashboards')
                 .setDescription('Commands available to every user on the server.')
                 .addFields(
-                    { name: 'Interactive Incident Menu', value: 'Opens a dropdown menu to read the technical updates for a specific service that went down.\n```bash\n!status\n```' },
-                    { name: 'Global Dashboard', value: 'Generates a panel with every service organized by stack, showing who is Online 🟩, degraded 🟨 or Offline 🟥 right now. Has a refresh button.\n```bash\n!status all\n```' },
-                    { name: 'Uptime Report', value: 'Calculates the percentage of time every system stayed up, and its average response time.\n```bash\n!report [days]\n```' }
+                    { name: 'Interactive Incident Menu', value: 'Opens a dropdown menu to read the technical updates for a specific service that went down.\n```bash\n!status\n```or `/status service`' },
+                    { name: 'Global Dashboard', value: 'Generates a panel with every service organized by stack, showing who is Online 🟩, degraded 🟨 or Offline 🟥 right now. Has a refresh button.\n```bash\n!status all\n```or `/status all`' },
+                    { name: 'Uptime Report', value: 'Calculates the percentage of time every system stayed up, and its average response time.\n```bash\n!report [days]\n```or `/report`' }
                 );
         } else if (i.customId === 'help_config') {
             newEmbed.setTitle('⚙️ Root Configuration')
                 .setDescription('Commands restricted to Discord **Administrators** only.')
                 .addFields(
-                    { name: 'Alert Engine Setup', value: 'Sets the bot\'s core rules: the channel to post to, who gets pinged on an outage, and who can manage the local project list.\n```bash\n# Usage:\n!config <#channel> <@alertRole> <@managerRole>\n\n# Real example:\n!config #devops @TechTeam @ProjectManagers\n```' }
+                    { name: 'Alert Engine Setup', value: 'Sets the bot\'s core rules: the channel to post to, who gets pinged on an outage, and who can manage the local project list.\n```bash\n# Usage:\n!config <#channel> <@alertRole> <@managerRole>\n\n# Real example:\n!config #devops @TechTeam @ProjectManagers\n```or `/config`' }
                 );
         } else if (i.customId === 'help_local') {
             newEmbed.setTitle('💻 Local Projects & Management')
                 .setDescription('Commands restricted to **Administrators** and **Manager Roles**. Your watchlist is private to this server.')
                 .addFields(
-                    { name: 'Add a URL to the Watchlist', value: 'Pings the URL every 5 minutes and checks SSL (if HTTPS).\n```bash\n!monitor <id> <url> <Display Name>\n```' },
-                    { name: 'Add a Jenkins Job', value: 'Polls `<job-url>/lastBuild/api/json` every 5 minutes. Put basic auth in the URL if needed: `http://user:pass@jenkins-host/job/X`.\n```bash\n!monitor-jenkins <id> <job_url> <Display Name>\n```' },
-                    { name: 'Disable SSL Check', value: '```bash\n!ssl ignore <id>\n```' },
-                    { name: 'Open a Maintenance Incident', value: 'Pauses monitoring while you update your system.\n```bash\n!incident <id> <Message>\n```' },
-                    { name: 'Resolve / Remove', value: '`!remove` asks for confirmation before deleting.\n```bash\n!resolve <id>\n!remove <id>\n```' },
-                    { name: 'Audit Log', value: 'Last 10 admin actions on this server.\n```bash\n!audit\n```' }
+                    { name: 'Add a URL to the Watchlist', value: 'Pings the URL every 5 minutes and checks SSL (if HTTPS).\n```bash\n!monitor <id> <url> <Display Name>\n```or `/monitor`' },
+                    { name: 'Add a Jenkins Job', value: 'Polls `<job-url>/lastBuild/api/json` every 5 minutes. Put basic auth in the URL if needed: `http://user:pass@jenkins-host/job/X`.\n```bash\n!monitor-jenkins <id> <job_url> <Display Name>\n```or `/monitor-jenkins`' },
+                    { name: 'Disable SSL Check', value: '```bash\n!ssl ignore <id>\n```or `/ssl-ignore`' },
+                    { name: 'Open a Maintenance Incident', value: 'Pauses monitoring while you update your system.\n```bash\n!incident <id> <Message>\n```or `/incident`' },
+                    { name: 'Resolve / Remove', value: '`!remove` asks for confirmation before deleting.\n```bash\n!resolve <id>\n!remove <id>\n```or `/resolve`, `/remove`' },
+                    { name: 'Audit Log', value: 'Last 10 admin actions on this server.\n```bash\n!audit\n```or `/audit`' }
                 );
         } else if (i.customId === 'help_webhook') {
             newEmbed.setTitle('📡 Webhooks & API')
                 .setDescription('The bot runs an Express server on port 3000 to receive payloads from any CI/CD pipeline (GitHub Actions, AWS, Jenkins).')
                 .addFields(
                     { name: 'POST Structure (JSON)', value: 'Send the request to `http://<bot-ip>:3000/webhook/<project_id>` with the header `X-API-KEY: <key>`\n```json\n{\n  "title": "CloudWatch Alert",\n  "message": "CPU usage hit 90% on the Web Server.",\n  "status": "error" \n}\n```' },
-                    { name: 'Channel per Project', value: 'Maps a project to its own channel AND issues it a dedicated API key. Once a server claims a `project_id`, only that server can remap or rotate it — other servers can\'t hijack it by reusing the same id.\n```bash\n!channel <project_id> #channel\n!channel rotate <project_id>\n```' },
-                    { name: 'Test it', value: '```bash\n!webhook test <project_id>\n```' }
+                    { name: 'Channel per Project', value: 'Maps a project to its own channel AND issues it a dedicated API key. Once a server claims a `project_id`, only that server can remap or rotate it — other servers can\'t hijack it by reusing the same id.\n```bash\n!channel <project_id> #channel\n!channel rotate <project_id>\n```or `/channel`, `/channel-rotate`' },
+                    { name: 'Test it', value: '```bash\n!webhook test <project_id>\n```or `/webhook-test`' }
                 );
         }
 
