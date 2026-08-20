@@ -195,8 +195,11 @@ function logAudit(guildId, userTag, action, details) {
 // hasProblem-only alerts (third-party catalog) broadcast to every configured guild by default.
 // Pass guildId to scope an alert to a single server — used for each guild's own local watchlist,
 // so one server's private project outage doesn't get posted into every other server's channel.
-function broadcastAlert(alertEmbed, hasProblem, guildId = null) {
-    alertEmbed.setColor(hasProblem ? COLORS.danger : COLORS.success);
+// severity lets third-party alerts (which have a real minor/major/critical tier from the status
+// page) show yellow instead of flattening everything non-'none' to red like a plain boolean would.
+function broadcastAlert(alertEmbed, hasProblem, guildId = null, severity = null) {
+    const sev = severity || (hasProblem ? 'critical' : 'none');
+    alertEmbed.setColor(sev === 'none' ? COLORS.success : sev === 'minor' ? COLORS.warning : COLORS.danger);
     alertEmbed.setTitle(hasProblem ? '🚨 Infrastructure Alert' : '✅ Systems Back to Normal');
 
     const guilds = guildId
@@ -246,8 +249,10 @@ async function fetchServiceStatus(service) {
     return { indicator: response.data.status.indicator, description: response.data.status.description };
 }
 
+const SEVERITY_RANK = { none: 0, minor: 1, major: 2, critical: 3 };
+
 async function monitorThirdParty() {
-    let hasChanged = false, hasProblem = false;
+    let hasChanged = false, hasProblem = false, worstSeverity = 'none';
     const alertEmbed = createEmbed().setFooter({ text: 'Automated NOC Center' });
 
     for (const [key, service] of Object.entries(endpoints)) {
@@ -260,7 +265,9 @@ async function monitorThirdParty() {
             if (!lastStatus[key]) lastStatus[key] = 'none';
             if (currentStatus !== 'none' && currentStatus !== lastStatus[key]) {
                 hasChanged = true; hasProblem = true;
-                alertEmbed.addFields({ name: `🔴 ${service.name}`, value: description });
+                if (SEVERITY_RANK[currentStatus] > SEVERITY_RANK[worstSeverity]) worstSeverity = currentStatus;
+                const emoji = currentStatus === 'minor' ? '🟡' : '🔴';
+                alertEmbed.addFields({ name: `${emoji} ${service.name}`, value: description });
             } else if (currentStatus === 'none' && lastStatus[key] !== 'none') {
                 hasChanged = true;
                 alertEmbed.addFields({ name: `✅ ${service.name}`, value: 'Operations back to normal.' });
@@ -269,7 +276,7 @@ async function monitorThirdParty() {
             insertHistory.run(key, currentStatus === 'none' ? 'UP' : 'DOWN', latency, null);
         } catch (error) { }
     }
-    if (hasChanged) broadcastAlert(alertEmbed, hasProblem);
+    if (hasChanged) broadcastAlert(alertEmbed, hasProblem, null, worstSeverity);
 }
 
 async function monitorGuildWatchlist(guildId, sites) {
