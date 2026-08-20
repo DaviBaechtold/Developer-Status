@@ -262,15 +262,16 @@ async function monitorThirdParty() {
             const { indicator: currentStatus, description } = await fetchServiceStatus(service);
             const latency = Date.now() - start;
 
+            const statusPage = service.url.split('/api/')[0];
             if (!lastStatus[key]) lastStatus[key] = 'none';
             if (currentStatus !== 'none' && currentStatus !== lastStatus[key]) {
                 hasChanged = true; hasProblem = true;
                 if (SEVERITY_RANK[currentStatus] > SEVERITY_RANK[worstSeverity]) worstSeverity = currentStatus;
                 const emoji = currentStatus === 'minor' ? '🟡' : '🔴';
-                alertEmbed.addFields({ name: `${emoji} ${service.name}`, value: description });
+                alertEmbed.addFields({ name: `${emoji} ${service.name}`, value: `${description} [Status page](${statusPage})` });
             } else if (currentStatus === 'none' && lastStatus[key] !== 'none') {
                 hasChanged = true;
-                alertEmbed.addFields({ name: `✅ ${service.name}`, value: 'Operations back to normal.' });
+                alertEmbed.addFields({ name: `✅ ${service.name}`, value: `Operations back to normal. [Status page](${statusPage})` });
             }
             setExtStatus(key, currentStatus);
             insertHistory.run(key, currentStatus === 'none' ? 'UP' : 'DOWN', latency, null);
@@ -301,17 +302,18 @@ async function monitorGuildWatchlist(guildId, sites) {
                 const latency = Date.now() - start;
                 if (data.result === null) continue; // build still running, skip this cycle
 
+                const jobLink = `${site.url.replace(/\/+$/, '')}/${data.number}/`;
                 if (data.result === 'SUCCESS') {
                     if (lastStatusMonitoredUrls[localKey(guildId, site.id)] === 'down') {
                         hasChanged = true;
-                        alertEmbed.addFields({ name: `✅ Build OK: ${site.name}`, value: `Last build (#${data.number}) passed.` });
+                        alertEmbed.addFields({ name: `✅ Build OK: ${site.name}`, value: `Last build [#${data.number}](${jobLink}) passed.` });
                     }
                     setLocalStatus(guildId, site.id, 'up');
                     insertHistory.run(site.id, 'UP', latency, guildId);
                 } else {
                     if (lastStatusMonitoredUrls[localKey(guildId, site.id)] !== 'down') {
                         hasChanged = true; hasProblem = true;
-                        alertEmbed.addFields({ name: `🚨 Build Failed: ${site.name}`, value: `Last build (#${data.number}) came back **${data.result}**.` });
+                        alertEmbed.addFields({ name: `🚨 Build Failed: ${site.name}`, value: `Last build [#${data.number}](${jobLink}) came back **${data.result}**.` });
                     }
                     setLocalStatus(guildId, site.id, 'down');
                     insertHistory.run(site.id, 'DOWN', latency, guildId);
@@ -333,7 +335,7 @@ async function monitorGuildWatchlist(guildId, sites) {
                 const sslStatus = await sslChecker(domain, { method: "GET", port: 443 });
                 if (sslStatus.daysRemaining <= 7 && sslStatus.daysRemaining > 0) {
                     hasChanged = true; hasProblem = true;
-                    alertEmbed.addFields({ name: `🔐 SSL Warning: ${site.name}`, value: `Expires in **${sslStatus.daysRemaining} days**.` });
+                    alertEmbed.addFields({ name: `🔐 SSL Warning: ${site.name}`, value: `Expires in **${sslStatus.daysRemaining} days**. [Check site](${site.url})` });
                 } else if (sslStatus.daysRemaining <= 0) {
                     throw new Error("SSL_EXPIRED");
                 }
@@ -344,7 +346,7 @@ async function monitorGuildWatchlist(guildId, sites) {
 
             if (lastStatusMonitoredUrls[localKey(guildId, site.id)] === 'down') {
                 hasChanged = true;
-                alertEmbed.addFields({ name: `✅ Online: ${site.name}`, value: `Connection restored.` });
+                alertEmbed.addFields({ name: `✅ Online: ${site.name}`, value: `Connection restored. [Visit](${site.url})` });
             }
             setLocalStatus(guildId, site.id, 'up');
             insertHistory.run(site.id, 'UP', latency, guildId);
@@ -354,7 +356,7 @@ async function monitorGuildWatchlist(guildId, sites) {
 
             if (lastStatusMonitoredUrls[localKey(guildId, site.id)] !== 'down') {
                 hasChanged = true; hasProblem = true;
-                alertEmbed.addFields({ name: `🚨 Offline: ${site.name}`, value: reason });
+                alertEmbed.addFields({ name: `🚨 Offline: ${site.name}`, value: `${reason} [Visit](${site.url})` });
             }
             setLocalStatus(guildId, site.id, 'down');
             insertHistory.run(site.id, 'DOWN', null, guildId);
