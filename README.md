@@ -72,6 +72,13 @@ curl -X POST http://<bot-ip>:3000/webhook/<project_id> \
 
 `status` can be `error` (red alert + role mention) or anything else (blue, informational). Each project mapped with `!channel` gets its own key — a leaked pipeline secret only exposes that one project's channel, not every server the bot is in. Unmapped ids fall back to the shared `WEBHOOK_KEY` and broadcast to every configured server.
 
+Add an optional `fields` array for a labeled two-column card instead of a flat description — same look the native GitHub events below get:
+
+```json
+{"title": "Deploy backend → homolog: OK", "status": "info",
+ "fields": [{"name": "Commit", "value": "`10806f8`", "inline": true}, {"name": "Environment", "value": "homolog", "inline": true}]}
+```
+
 For **GitHub** events (push, pull requests, issues, releases, workflow runs), there's a dedicated endpoint that speaks GitHub's own webhook format instead of the generic one above — no pipeline code needed, GitHub sends these itself:
 
 ```

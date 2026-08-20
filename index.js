@@ -216,7 +216,7 @@ function broadcastAlert(alertEmbed, hasProblem, guildId = null, severity = null)
     }
 }
 
-function dispatchWebhookAlert(webhookId, title, msg, hasProblem) {
+function dispatchWebhookAlert(webhookId, title, msg, hasProblem, fields = null) {
     // Pull the first URL out of the message and make the title clickable with it, gittrack-style,
     // instead of leaving a raw link buried mid-paragraph.
     const urlMatch = (msg || '').match(/https?:\/\/\S+/);
@@ -226,6 +226,15 @@ function dispatchWebhookAlert(webhookId, title, msg, hasProblem) {
         .setDescription(body || 'Event received.')
         .setFooter({ text: `Webhook · ${webhookId}` });
     if (urlMatch) hookEmbed.setURL(urlMatch[0]);
+    // Optional structured fields (payload can send { fields: [{name, value, inline}] }) for the
+    // same labeled two-column card look GitHub events get, instead of a flat description string.
+    if (Array.isArray(fields) && fields.length > 0) {
+        hookEmbed.addFields(fields.slice(0, 25).map(f => ({
+            name: clamp(f?.name, 256) || '​',
+            value: clamp(f?.value, 1024) || '​',
+            inline: !!f?.inline
+        })));
+    }
 
     const projectChannel = db.prepare(`SELECT channel_id FROM webhook_channels WHERE webhook_id = ?`).get(webhookId);
     if (projectChannel) {
@@ -783,53 +792,83 @@ app.get('/health', (req, res) => {
 // Native GitHub webhook events (push, pull_request, issues, release, workflow_run) with
 // per-type embeds — mirrors gittrack-discord-bot's layout. Auth is GitHub's own scheme:
 // HMAC-SHA256 of the raw body using the project's !channel key as the webhook secret.
+// Mirrors gittrack-discord-bot's embed pattern: the actual GitHub sender as embed author
+// (real avatar, not the bot's), repo/branches as linked+backtick fields, event-named footer.
 function buildGithubEventEmbed(event, action, payload) {
     const repo = payload.repository?.full_name || 'unknown repo';
-    const sender = payload.sender?.login || 'someone';
+    const repoUrl = payload.repository?.html_url;
+    const repoLink = repoUrl ? `[${repo}](${repoUrl})` : repo;
+    const sender = payload.sender;
+    const author = sender ? { name: sender.login, iconURL: sender.avatar_url, url: sender.html_url } : null;
 
     if (event === 'push') {
         const branch = (payload.ref || '').replace('refs/heads/', '');
         const commits = (payload.commits || []).slice(0, 5)
-            .map(c => `[\`${c.id.slice(0, 7)}\`](${c.url}) ${clamp(c.message.split('\n')[0], 80)} — ${c.author?.name || sender}`)
+            .map(c => `[\`${c.id.slice(0, 7)}\`](${c.url}) ${clamp(c.message.split('\n')[0], 80)}`)
             .join('\n') || 'No commits (branch deleted or empty push).';
-        return new EmbedBuilder().setColor(COLORS.info).setTitle(`📦 Push to ${repo} (${branch})`)
-            .setURL(payload.compare).setDescription(commits).setFooter({ text: 'GitHub Push' }).setTimestamp();
+        const embed = new EmbedBuilder().setColor('#4F46E5').setTitle(`🚀 New Push to ${branch}`)
+            .setURL(payload.compare).setDescription(commits)
+            .addFields(
+                { name: 'Repository', value: repoLink, inline: true },
+                { name: 'Branch', value: `\`${branch}\``, inline: true },
+                { name: 'Pusher', value: payload.pusher?.name || sender?.login || 'Unknown', inline: false }
+            ).setFooter({ text: 'GitHub Push Event' }).setTimestamp();
+        if (author) embed.setAuthor(author);
+        return embed;
     }
     if (event === 'pull_request') {
         const pr = payload.pull_request;
         const merged = action === 'closed' && pr.merged;
-        const emoji = merged ? '🟣' : action === 'opened' ? '🟢' : action === 'closed' ? '🔴' : '📝';
-        const label = merged ? 'merged' : action;
-        return new EmbedBuilder().setColor(merged ? '#8957E5' : action === 'opened' ? COLORS.success : COLORS.danger)
-            .setTitle(`${emoji} PR #${pr.number} ${label}: ${clamp(pr.title, 200)}`).setURL(pr.html_url)
+        let emoji = '📋', color = '#768390', label = action.charAt(0).toUpperCase() + action.slice(1);
+        if (action === 'opened' || action === 'reopened') { emoji = '🔍'; color = COLORS.success; }
+        else if (merged) { emoji = '🟣'; color = '#8957E5'; label = 'Merged'; }
+        else if (action === 'closed') { emoji = '❌'; color = COLORS.danger; }
+        else if (action === 'synchronize') { emoji = '📝'; color = COLORS.info; label = 'Updated'; }
+
+        const embed = new EmbedBuilder().setColor(color).setTitle(`${emoji} Pull Request #${pr.number} ${label}: ${clamp(pr.title, 200)}`)
+            .setURL(pr.html_url)
             .addFields(
-                { name: 'Repository', value: repo, inline: true },
-                { name: 'Author', value: pr.user?.login || sender, inline: true },
-                { name: 'Branch', value: `${pr.head?.ref} → ${pr.base?.ref}`, inline: true }
+                { name: 'Repository', value: repoLink, inline: false },
+                { name: 'Branches', value: `\`${pr.head?.ref}\` → \`${pr.base?.ref}\``, inline: true },
+                { name: 'State', value: pr.state.charAt(0).toUpperCase() + pr.state.slice(1), inline: true }
             ).setFooter({ text: 'GitHub Pull Request' }).setTimestamp();
+        if (merged && pr.merged_by) embed.addFields({ name: 'Merged by', value: pr.merged_by.login, inline: true });
+        if (pr.body) embed.setDescription(clamp(pr.body, 300));
+        if (author) embed.setAuthor({ name: pr.user?.login || author.name, iconURL: pr.user?.avatar_url || author.iconURL, url: pr.user?.html_url || author.url });
+        return embed;
     }
     if (event === 'issues') {
         const issue = payload.issue;
-        return new EmbedBuilder().setColor(action === 'opened' ? COLORS.warning : COLORS.danger)
-            .setTitle(`${action === 'opened' ? '🟡' : '⚪'} Issue #${issue.number} ${action}: ${clamp(issue.title, 200)}`)
+        const opened = action === 'opened';
+        const embed = new EmbedBuilder().setColor(opened ? COLORS.warning : COLORS.danger)
+            .setTitle(`${opened ? '🟡' : '⚪'} Issue #${issue.number} ${action}: ${clamp(issue.title, 200)}`)
             .setURL(issue.html_url)
-            .addFields({ name: 'Repository', value: repo, inline: true }, { name: 'Author', value: issue.user?.login || sender, inline: true })
+            .addFields({ name: 'Repository', value: repoLink, inline: false })
             .setFooter({ text: 'GitHub Issue' }).setTimestamp();
+        if (issue.body) embed.setDescription(clamp(issue.body, 300));
+        if (author) embed.setAuthor({ name: issue.user?.login || author.name, iconURL: issue.user?.avatar_url || author.iconURL, url: issue.user?.html_url || author.url });
+        return embed;
     }
     if (event === 'release') {
         const rel = payload.release;
-        return new EmbedBuilder().setColor(COLORS.success).setTitle(`🚀 New release: ${rel.tag_name}`)
-            .setURL(rel.html_url).addFields({ name: 'Repository', value: repo, inline: true })
+        const embed = new EmbedBuilder().setColor(COLORS.success).setTitle(`🚀 New release: ${rel.tag_name}`)
+            .setURL(rel.html_url).addFields({ name: 'Repository', value: repoLink, inline: false })
             .setDescription(clamp(rel.body, 500) || 'No release notes.').setFooter({ text: 'GitHub Release' }).setTimestamp();
+        if (author) embed.setAuthor(author);
+        return embed;
     }
     if (event === 'workflow_run') {
         const run = payload.workflow_run;
         const ok = run.conclusion === 'success';
-        return new EmbedBuilder().setColor(ok ? COLORS.success : COLORS.danger)
+        const embed = new EmbedBuilder().setColor(ok ? COLORS.success : COLORS.danger)
             .setTitle(`${ok ? '✅' : '❌'} Workflow "${run.name}" ${run.conclusion || run.status}`)
             .setURL(run.html_url)
-            .addFields({ name: 'Repository', value: repo, inline: true }, { name: 'Branch', value: run.head_branch || '?', inline: true })
-            .setFooter({ text: 'GitHub Actions' }).setTimestamp();
+            .addFields(
+                { name: 'Repository', value: repoLink, inline: true },
+                { name: 'Branch', value: `\`${run.head_branch || '?'}\``, inline: true }
+            ).setFooter({ text: 'GitHub Actions' }).setTimestamp();
+        if (author) embed.setAuthor(author);
+        return embed;
     }
     return null; // unhandled event type (ping, star, fork, etc.) — ack without posting
 }
@@ -868,7 +907,7 @@ app.post('/webhook/:id', (req, res) => {
         if (!expectedKey || !timingSafeEqualStr(req.get('X-API-KEY'), expectedKey)) return res.status(401).send({ message: 'Unauthorized' });
 
         const hasProblem = (req.body.status || 'error').toLowerCase() === 'error';
-        dispatchWebhookAlert(req.params.id, clamp(req.body.title, 200), clamp(req.body.message, 3500), hasProblem);
+        dispatchWebhookAlert(req.params.id, clamp(req.body.title, 200), clamp(req.body.message, 3500), hasProblem, req.body.fields);
         res.status(200).send({ message: 'OK' });
     } catch (e) {
         console.error('Webhook error:', e);
@@ -1141,6 +1180,20 @@ function attachHelpCollector(msgHelp, authorId) {
                     },
                     {
                         name: '3️⃣ Verify', value: 'Push a commit / run the pipeline, or just run `!webhook test my-project` to fire a sample alert without waiting for a real build.'
+                    },
+                    {
+                        name: '✨ Optional: labeled fields (gittrack-style card)', value:
+                            'Add a `fields` array to the JSON body for a two-column card instead of plain text:\n' +
+                            '```json\n' +
+                            '{\n' +
+                            '  "title": "Deploy backend → homolog: OK",\n' +
+                            '  "status": "info",\n' +
+                            '  "fields": [\n' +
+                            '    {"name": "Commit", "value": "`${GIT_COMMIT.take(7)}`", "inline": true},\n' +
+                            '    {"name": "Environment", "value": "homolog", "inline": true}\n' +
+                            '  ]\n' +
+                            '}\n' +
+                            '```'
                     }
                 );
         }
