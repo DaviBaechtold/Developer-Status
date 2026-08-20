@@ -177,7 +177,7 @@ function hasPermission(member, guildId) {
 }
 
 // Single visual base — every embed the bot sends is born here, so nothing drifts into its own look.
-const COLORS = { danger: '#ED4245', success: '#57F287', info: '#3498DB', neutral: '#2B2D31' };
+const COLORS = { danger: '#ED4245', success: '#57F287', info: '#3498DB', neutral: '#2B2D31', warning: '#FEE75C' };
 
 function createEmbed(color = COLORS.neutral) {
     return new EmbedBuilder()
@@ -538,7 +538,7 @@ function buildStatusAllEmbed(guild) {
     const formatLine = (key, service) => {
         const status = lastStatus[key];
         const emoji = status === 'none' ? '🟩' : status === 'minor' ? '🟨' : '🟥';
-        return `${emoji} \`${service.name.padEnd(16, ' ')}\`\n`;
+        return `${emoji} ${service.name}`;
     };
 
     const panels = {};
@@ -547,34 +547,38 @@ function buildStatusAllEmbed(guild) {
         for (const [stackName, keyList] of Object.entries(STACKS)) {
             if (keyList.includes(key)) { foundStack = stackName; break; }
         }
-        if (!panels[foundStack]) panels[foundStack] = '';
-        panels[foundStack] += formatLine(key, service);
+        if (!panels[foundStack]) panels[foundStack] = [];
+        panels[foundStack].push(formatLine(key, service));
     }
 
-    for (const [stack, text] of Object.entries(panels)) {
-        panelEmbed.addFields({ name: stack, value: text, inline: true });
+    for (const [stack, lines] of Object.entries(panels)) {
+        panelEmbed.addFields({ name: stack, value: lines.join('\n'), inline: true });
     }
 
     let localText = '';
     const projects = guild ? db.prepare(`SELECT id, name, manual_incident FROM monitored_urls WHERE guild_id = ?`).all(guild.id) : [];
     if (projects.length > 0) {
-        for (const p of projects) {
-            const name = p.name.length > 25 ? p.name.slice(0, 24) + '…' : p.name;
-            if (p.manual_incident) {
-                localText += `🟨 \`${name.padEnd(25, ' ')}\` *(Maintenance)*\n`;
-            } else {
-                const isUp = lastStatusMonitoredUrls[localKey(guild.id, p.id)] === 'up';
-                localText += `${isUp ? '🟩' : '🟥'} \`${name.padEnd(25, ' ')}\`\n`;
-            }
-        }
+        localText = projects.map(p => {
+            const name = p.name.length > 40 ? p.name.slice(0, 39) + '…' : p.name;
+            if (p.manual_incident) return `🟨 ${name} *(Maintenance)*`;
+            const isUp = lastStatusMonitoredUrls[localKey(guild.id, p.id)] === 'up';
+            return `${isUp ? '🟩' : '🟥'} ${name}`;
+        }).join('\n');
     } else {
-        localText = '```\nNo local project on the watchlist.\n```';
+        localText = 'No local project on the watchlist.';
     }
 
     panelEmbed.addFields(
         { name: '​', value: '​', inline: false },
         { name: '💻 Your Local Applications', value: localText, inline: false }
     );
+
+    // ponytail: worst-status-wins color, mirrors the per-state coloring gittrack uses on its embeds
+    const statuses = Object.values(lastStatus);
+    const projectDown = projects.some(p => !p.manual_incident && lastStatusMonitoredUrls[localKey(guild.id, p.id)] !== 'up');
+    if (statuses.some(s => s === 'major' || s === 'critical') || projectDown) panelEmbed.setColor(COLORS.danger);
+    else if (statuses.some(s => s === 'minor') || projects.some(p => p.manual_incident)) panelEmbed.setColor(COLORS.warning);
+    else panelEmbed.setColor(COLORS.success);
 
     return panelEmbed;
 }
