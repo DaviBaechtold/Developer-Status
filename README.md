@@ -72,7 +72,18 @@ curl -X POST http://<bot-ip>:3000/webhook/<project_id> \
 
 `status` can be `error` (red alert + role mention) or anything else (blue, informational). Each project mapped with `!channel` gets its own key — a leaked pipeline secret only exposes that one project's channel, not every server the bot is in. Unmapped ids fall back to the shared `WEBHOOK_KEY` and broadcast to every configured server.
 
-For **GitHub** (push/PR/commits), you usually don't even need this endpoint — Discord's native channel webhook can be wired up directly in the repo settings. This endpoint (and `!monitor-jenkins`) is for CI/CD signal that has no native Discord integration.
+For **GitHub** events (push, pull requests, issues, releases, workflow runs), there's a dedicated endpoint that speaks GitHub's own webhook format instead of the generic one above — no pipeline code needed, GitHub sends these itself:
+
+```
+Repo → Settings → Webhooks → Add webhook
+Payload URL: http://<bot-ip>:3000/github-webhook/<project_id>
+Content type: application/json
+Secret: <project's key from !channel>
+```
+
+Auth here is GitHub's own scheme (`X-Hub-Signature-256`, HMAC-SHA256 of the raw body using the project's key as secret), not the `X-API-KEY` header. Each event type gets its own embed (push shows the commit list, PRs/issues show state and author, releases show the tag, workflow runs show pass/fail) — mirrors the layout style of [gittrack-discord-bot](https://github.com/luuccaaaa/gittrack-discord-bot). Unrecognized event types are acknowledged and dropped rather than posted.
+
+Everything else — Jenkins, CloudWatch, or any pipeline step you write yourself — uses the generic endpoint below.
 
 `GET /health` is unauthenticated on purpose (no key needed) and returns whether the bot is connected to Discord — point an external uptime monitor (UptimeRobot, etc.) at it to get alerted if the host goes down. See the "Fallback if the VM goes down" section in [DEPLOY.md](DEPLOY.md).
 

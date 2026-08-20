@@ -21,7 +21,8 @@ const client = new Client({
 });
 
 const app = express();
-app.use(express.json());
+// GitHub signs the raw request bytes, not the re-serialized JSON — capture them before parsing.
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 const db = new Database('./bot_data.sqlite');
 
@@ -763,6 +764,85 @@ app.get('/health', (req, res) => {
     res.status(client.isReady() ? 200 : 503).send({ discord: client.isReady() ? 'connected' : 'connecting' });
 });
 
+// Native GitHub webhook events (push, pull_request, issues, release, workflow_run) with
+// per-type embeds — mirrors gittrack-discord-bot's layout. Auth is GitHub's own scheme:
+// HMAC-SHA256 of the raw body using the project's !channel key as the webhook secret.
+function buildGithubEventEmbed(event, action, payload) {
+    const repo = payload.repository?.full_name || 'unknown repo';
+    const sender = payload.sender?.login || 'someone';
+
+    if (event === 'push') {
+        const branch = (payload.ref || '').replace('refs/heads/', '');
+        const commits = (payload.commits || []).slice(0, 5)
+            .map(c => `[\`${c.id.slice(0, 7)}\`](${c.url}) ${clamp(c.message.split('\n')[0], 80)} — ${c.author?.name || sender}`)
+            .join('\n') || 'No commits (branch deleted or empty push).';
+        return new EmbedBuilder().setColor(COLORS.info).setTitle(`📦 Push to ${repo} (${branch})`)
+            .setURL(payload.compare).setDescription(commits).setFooter({ text: 'GitHub Push' }).setTimestamp();
+    }
+    if (event === 'pull_request') {
+        const pr = payload.pull_request;
+        const merged = action === 'closed' && pr.merged;
+        const emoji = merged ? '🟣' : action === 'opened' ? '🟢' : action === 'closed' ? '🔴' : '📝';
+        const label = merged ? 'merged' : action;
+        return new EmbedBuilder().setColor(merged ? '#8957E5' : action === 'opened' ? COLORS.success : COLORS.danger)
+            .setTitle(`${emoji} PR #${pr.number} ${label}: ${clamp(pr.title, 200)}`).setURL(pr.html_url)
+            .addFields(
+                { name: 'Repository', value: repo, inline: true },
+                { name: 'Author', value: pr.user?.login || sender, inline: true },
+                { name: 'Branch', value: `${pr.head?.ref} → ${pr.base?.ref}`, inline: true }
+            ).setFooter({ text: 'GitHub Pull Request' }).setTimestamp();
+    }
+    if (event === 'issues') {
+        const issue = payload.issue;
+        return new EmbedBuilder().setColor(action === 'opened' ? COLORS.warning : COLORS.danger)
+            .setTitle(`${action === 'opened' ? '🟡' : '⚪'} Issue #${issue.number} ${action}: ${clamp(issue.title, 200)}`)
+            .setURL(issue.html_url)
+            .addFields({ name: 'Repository', value: repo, inline: true }, { name: 'Author', value: issue.user?.login || sender, inline: true })
+            .setFooter({ text: 'GitHub Issue' }).setTimestamp();
+    }
+    if (event === 'release') {
+        const rel = payload.release;
+        return new EmbedBuilder().setColor(COLORS.success).setTitle(`🚀 New release: ${rel.tag_name}`)
+            .setURL(rel.html_url).addFields({ name: 'Repository', value: repo, inline: true })
+            .setDescription(clamp(rel.body, 500) || 'No release notes.').setFooter({ text: 'GitHub Release' }).setTimestamp();
+    }
+    if (event === 'workflow_run') {
+        const run = payload.workflow_run;
+        const ok = run.conclusion === 'success';
+        return new EmbedBuilder().setColor(ok ? COLORS.success : COLORS.danger)
+            .setTitle(`${ok ? '✅' : '❌'} Workflow "${run.name}" ${run.conclusion || run.status}`)
+            .setURL(run.html_url)
+            .addFields({ name: 'Repository', value: repo, inline: true }, { name: 'Branch', value: run.head_branch || '?', inline: true })
+            .setFooter({ text: 'GitHub Actions' }).setTimestamp();
+    }
+    return null; // unhandled event type (ping, star, fork, etc.) — ack without posting
+}
+
+app.post('/github-webhook/:id', (req, res) => {
+    try {
+        if (isRateLimited(req.ip)) return res.status(429).send({ message: 'Too many requests' });
+
+        const projectChannel = db.prepare(`SELECT channel_id, webhook_key FROM webhook_channels WHERE webhook_id = ?`).get(req.params.id);
+        if (!projectChannel?.webhook_key) return res.status(401).send({ message: 'Unauthorized' });
+
+        const signature = req.get('X-Hub-Signature-256') || '';
+        const expected = 'sha256=' + crypto.createHmac('sha256', projectChannel.webhook_key).update(req.rawBody || Buffer.alloc(0)).digest('hex');
+        if (!timingSafeEqualStr(signature, expected)) return res.status(401).send({ message: 'Unauthorized' });
+
+        const event = req.get('X-GitHub-Event');
+        if (event === 'ping') return res.status(200).send({ message: 'pong' });
+
+        const action = req.body.action;
+        const embed = buildGithubEventEmbed(event, action, req.body);
+        if (embed) client.channels.fetch(projectChannel.channel_id).then(channel => channel?.send({ embeds: [embed] })).catch(() => {});
+
+        res.status(200).send({ message: 'OK' });
+    } catch (e) {
+        console.error('GitHub webhook error:', e);
+        res.status(400).send({ message: 'Bad request' });
+    }
+});
+
 app.post('/webhook/:id', (req, res) => {
     try {
         if (isRateLimited(req.ip)) return res.status(429).send({ message: 'Too many requests' });
@@ -1002,7 +1082,8 @@ function attachHelpCollector(msgHelp, authorId) {
                 .addFields(
                     { name: 'POST Structure (JSON)', value: 'Send the request to `http://<bot-ip>:3000/webhook/<project_id>` with the header `X-API-KEY: <key>`\n```json\n{\n  "title": "CloudWatch Alert",\n  "message": "CPU usage hit 90% on the Web Server.",\n  "status": "error" \n}\n```' },
                     { name: 'Channel per Project', value: 'Maps a project to its own channel AND issues it a dedicated API key. Once a server claims a `project_id`, only that server can remap or rotate it — other servers can\'t hijack it by reusing the same id.\n```bash\n!channel <project_id> #channel\n!channel rotate <project_id>\n```or `/channel`, `/channel-rotate`' },
-                    { name: 'Test it', value: '```bash\n!webhook test <project_id>\n```or `/webhook-test`' }
+                    { name: 'Test it', value: '```bash\n!webhook test <project_id>\n```or `/webhook-test`' },
+                    { name: 'Native GitHub events (push/PR/issue/release/workflow_run)', value: 'Repo → **Settings → Webhooks → Add webhook** → Payload URL `http://<bot-ip>:3000/github-webhook/<project_id>`, content type `application/json`, **Secret** = the key from `!channel`, events: whichever you want. No pipeline code needed — GitHub sends these on its own, formatted per event type (colored embed with commit/PR/issue/release/run details).' }
                 );
         } else if (i.customId === 'help_tutorial') {
             newEmbed.setTitle('🛠️ CI/CD Tutorial — Step by Step')
