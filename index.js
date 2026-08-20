@@ -180,10 +180,11 @@ function hasPermission(member, guildId) {
 // Single visual base — every embed the bot sends is born here, so nothing drifts into its own look.
 const COLORS = { danger: '#ED4245', success: '#57F287', info: '#3498DB', neutral: '#2B2D31', warning: '#FEE75C' };
 
+// ponytail: no setAuthor here — Discord already renders the bot's own name/avatar above every
+// message it sends, so a "NOC Bot" author row just duplicated that. Dropped for a cleaner embed.
 function createEmbed(color = COLORS.neutral) {
     return new EmbedBuilder()
         .setColor(color)
-        .setAuthor({ name: 'NOC Bot', iconURL: client.user.displayAvatarURL() })
         .setTimestamp();
 }
 
@@ -216,9 +217,15 @@ function broadcastAlert(alertEmbed, hasProblem, guildId = null, severity = null)
 }
 
 function dispatchWebhookAlert(webhookId, title, msg, hasProblem) {
+    // Pull the first URL out of the message and make the title clickable with it, gittrack-style,
+    // instead of leaving a raw link buried mid-paragraph.
+    const urlMatch = (msg || '').match(/https?:\/\/\S+/);
+    const body = urlMatch ? msg.replace(urlMatch[0], '').trim() : msg;
     const hookEmbed = createEmbed(hasProblem ? COLORS.danger : COLORS.info)
-        .setTitle(`📡 Webhook [${webhookId}]: ${title || 'External Alert'}`)
-        .setDescription(msg || 'Event received.');
+        .setTitle(`${hasProblem ? '🔴' : '🟢'} ${title || 'External Alert'}`)
+        .setDescription(body || 'Event received.')
+        .setFooter({ text: `Webhook · ${webhookId}` });
+    if (urlMatch) hookEmbed.setURL(urlMatch[0]);
 
     const projectChannel = db.prepare(`SELECT channel_id FROM webhook_channels WHERE webhook_id = ?`).get(webhookId);
     if (projectChannel) {
