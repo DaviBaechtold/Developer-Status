@@ -216,16 +216,17 @@ function broadcastAlert(alertEmbed, hasProblem, guildId = null, severity = null)
     }
 }
 
-function dispatchWebhookAlert(webhookId, title, msg, hasProblem, fields = null) {
-    // Pull the first URL out of the message and make the title clickable with it, gittrack-style,
-    // instead of leaving a raw link buried mid-paragraph.
-    const urlMatch = (msg || '').match(/https?:\/\/\S+/);
+function dispatchWebhookAlert(webhookId, title, msg, hasProblem, fields = null, url = null) {
+    // An explicit `url` in the payload makes the title clickable, gittrack-style. Fall back to
+    // pulling the first URL out of the message for payloads written before this existed.
+    const urlMatch = !url && (msg || '').match(/https?:\/\/\S+/);
     const body = urlMatch ? msg.replace(urlMatch[0], '').trim() : msg;
     const hookEmbed = createEmbed(hasProblem ? COLORS.danger : COLORS.info)
         .setTitle(`${hasProblem ? '🔴' : '🟢'} ${title || 'External Alert'}`)
         .setDescription(body || 'Event received.')
         .setFooter({ text: `Webhook · ${webhookId}` });
-    if (urlMatch) hookEmbed.setURL(urlMatch[0]);
+    if (url) hookEmbed.setURL(url);
+    else if (urlMatch) hookEmbed.setURL(urlMatch[0]);
     // Optional structured fields (payload can send { fields: [{name, value, inline}] }) for the
     // same labeled two-column card look GitHub events get, instead of a flat description string.
     if (Array.isArray(fields) && fields.length > 0) {
@@ -907,7 +908,7 @@ app.post('/webhook/:id', (req, res) => {
         if (!expectedKey || !timingSafeEqualStr(req.get('X-API-KEY'), expectedKey)) return res.status(401).send({ message: 'Unauthorized' });
 
         const hasProblem = (req.body.status || 'error').toLowerCase() === 'error';
-        dispatchWebhookAlert(req.params.id, clamp(req.body.title, 200), clamp(req.body.message, 3500), hasProblem, req.body.fields);
+        dispatchWebhookAlert(req.params.id, clamp(req.body.title, 200), clamp(req.body.message, 3500), hasProblem, req.body.fields, clamp(req.body.url, 500) || null);
         res.status(200).send({ message: 'OK' });
     } catch (e) {
         console.error('Webhook error:', e);
