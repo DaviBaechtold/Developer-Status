@@ -1242,13 +1242,23 @@ client.on('messageCreate', async (message) => {
     if (command === '!channel') {
         if (!hasPermission(message.member, message.guild.id)) return message.reply('❌ Access Denied.');
 
+        // The `!text` reply lands in a normal, permanent channel message — never put the raw key
+        // there. DM it instead, same as the slash version's `ephemeral: true` achieves.
+        const sendKeyPrivately = async (webhookId, key) => {
+            try {
+                await message.author.send(`🔑 Key for \`${webhookId}\`: \`${key}\``);
+                return true;
+            } catch { return false; } // DMs closed
+        };
+
         if (args[1] === 'rotate') {
             const webhookId = args[2]?.toLowerCase();
             if (!webhookId) return message.reply('⚠️ Usage: `!channel rotate <webhook_id>`');
             const result = doChannelRotate(message.guild.id, message.author.tag, webhookId);
             if (result.error === 'missing') return message.reply(`⚠️ No channel mapped for \`${webhookId}\` yet. Use \`!channel <id> #channel\` first.`);
             if (result.error === 'taken') return message.reply(`❌ \`${webhookId}\` is owned by another server.`);
-            return message.reply(`🔑 New API key for \`${webhookId}\`: \`${result.key}\` (old one stopped working).`);
+            const dmOk = await sendKeyPrivately(webhookId, result.key);
+            return message.reply(dmOk ? `✅ New key for \`${webhookId}\` sent to your DMs (old one stopped working).` : `⚠️ Rotated, but your DMs are closed — open them to me and run \`!channel rotate ${webhookId}\` again to receive the key.`);
         }
 
         const webhookId = args[1]?.toLowerCase();
@@ -1257,7 +1267,9 @@ client.on('messageCreate', async (message) => {
 
         const result = doChannelMap(message.guild.id, message.author.tag, webhookId, channel.id);
         if (result.error === 'taken') return message.reply(`❌ \`${webhookId}\` is already owned by another server.`);
-        return message.reply(`✅ Webhooks for \`${webhookId}\` (\`http://<bot-ip>:3000/webhook/${webhookId}\`) now land in ${channel}.\n${result.isNew ? `🔑 API key (save it, only shown again with \`!channel rotate\`): \`${result.key}\`` : `🔑 API key unchanged: \`${result.key}\``}`);
+        if (!result.isNew) return message.reply(`✅ Webhooks for \`${webhookId}\` (\`http://<bot-ip>:3000/webhook/${webhookId}\`) now land in ${channel}. Key unchanged — use \`!channel rotate ${webhookId}\` if you lost it.`);
+        const dmOk = await sendKeyPrivately(webhookId, result.key);
+        return message.reply(`✅ Webhooks for \`${webhookId}\` (\`http://<bot-ip>:3000/webhook/${webhookId}\`) now land in ${channel}.\n${dmOk ? '🔑 API key sent to your DMs (save it, only shown again with `!channel rotate`).' : `⚠️ Your DMs are closed — open them to me and run \`!channel rotate ${webhookId}\` to receive the key.`}`);
     }
 
     if (command === '!webhook' && args[1] === 'test') {
